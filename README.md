@@ -2,22 +2,19 @@
 ### FHEM Module To Control ESPEasy
 
 To bind this module into FHEM update service use the FHEM following commands:
-* `update add https://raw.githubusercontent.com/ddtlabs/ESPEasy/master/controls_ESPEasy.txt`
+* `update add https://raw.githubusercontent.com/ddtlabs/ESPEasy/develop/controls_ESPEasy.txt`
 * `update` 
 
 To remove this module from FHEM update service use the FHEM following command:
-* `update delete https://raw.githubusercontent.com/ddtlabs/ESPEasy/master/controls_ESPEasy.txt`
+* `update delete https://raw.githubusercontent.com/ddtlabs/ESPEasy/develop/controls_ESPEasy.txt`
 
 To install only once (no automatic updates via FHEM update command):
-* `update all https://raw.githubusercontent.com/ddtlabs/ESPEasy/master/controls_ESPEasy.txt`
+* `update all https://raw.githubusercontent.com/ddtlabs/ESPEasy/develop/controls_ESPEasy.txt`
 
 Or just download the module and copy it to your FHEM-Modul folder.
 
 More information about FHEM update can be found here:
-
-[FHEMWIKI](http://www.fhemwiki.de/wiki/Update)
-
-[FHEM command reference](http://fhem.de/commandref.html#update)
+[FHEMWIKI](http://www.fhemwiki.de/wiki/Update) [FHEM command reference](http://fhem.de/commandref.html#update)
 
 
 ### Release Notes:
@@ -45,4 +42,11 @@ More information about FHEM update can be found here:
       - added get command "pinMap" (displays pin mapping)
       - show usage if there are too few arguments
       - command reference adopted
+
+0.2.0 - chanched module design to bridge/device version
+0.2.1 - own tcp port (default 8383) for communication from esp to fhem
+      - added basic authentication for incoming requests
+      - added attribut readingPrefixGPIO
+      - added attribut readingSuffixGPIOState
+      
 ```
