@@ -48,5 +48,11 @@ More information about FHEM update can be found here:
       - added basic authentication for incoming requests
       - added attribut readingPrefixGPIO
       - added attribut readingSuffixGPIOState
+0.2.2 - fixed statusRequest/presentCheck
+      - minor fixes: copy/paste errors...
+      - approved logging to better fit dev guide lines
+      - handle renaming of devices
+      - commands are case sensitive again, sorry :(
+0.2.3 - released
       
 ```
