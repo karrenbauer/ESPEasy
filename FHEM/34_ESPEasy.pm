@@ -57,6 +57,9 @@
 #                    - approved logging to better fit dev guide lines
 #                    - handle renaming of devices
 #                    - commands are case sensitive again, sorry :(
+# 2016-08-11  0.2.3  - added pwmfade command #https://forum.fhem.de/index.php/topic,55728.msg480966.html#msg480966
+#                    - added raw command to send own commands to esp. 
+#                      usage: 'raw <newCommand> <param1> <param2> <...>'
 #             
 #
 #   Credit goes to:
@@ -111,6 +114,7 @@ sub ESPEasy_whoami();
 my %ESPEasy_setCmds = (
   "gpio"           => "2",
   "pwm"            => "2",
+  "pwmfade"        => "3",
   "pulse"          => "3",
   "longpulse"      => "3",
   "servo"          => "3",
@@ -124,6 +128,7 @@ my %ESPEasy_setCmds = (
   "pcfpulse"       => "3",
   "pcflongpulse"   => "3",
   "status"         => "2",
+  "raw"            => "1",
   "statusRequest"  => "0", 
   "clearreadings"  => "0",
   "help"           => "1"
@@ -145,9 +150,11 @@ my %ESPEasy_setCmdsUsage = (
   "oledcmd"        => "pcapwm <on|off|clear>",
   "pcapwm"         => "pcapwm <pin> <Level>",
   "pcfgpio"        => "pcfgpio <pin> <0|1|off|on>",
-  "pcfpulse"       => "pcfpulse <pin> <0|1|off|on> <duration>",    #missing docu
-  "pcflongPulse"   => "pcflongPulse <pin> <0|1|off|on> <duration>",#missing docu
+  "pcfpulse"       => "pcfpulse <pin> <0|1|off|on> <duration>",     #missing docu
+  "pcflongPulse"   => "pcflongPulse <pin> <0|1|off|on> <duration>", #missing docu
   "status"         => "status <device> <pin>",
+  "pwmfade"        => "pwmfade <pin> <target> <duration>", #https://forum.fhem.de/index.php/topic,55728.msg480966.html#msg480966
+  "raw"            => "raw <esp_comannd> <...>",
 
   "statusRequest"  => "statusRequest",
   "clearreadings"  => "clearReadings",
@@ -230,6 +237,7 @@ sub ESPEasy_Initialize($)
                         ."authentication:1,0 "
                         ."readingPrefixGPIO "
                         ."readingSuffixGPIOState "
+                        ."httpReqTimeout "
                         .$readingFnAttributes;
 }
 
@@ -305,7 +313,7 @@ sub ESPEasy_Get($@)
   my $ret;
 ####uc
 #  if (lc $reading eq "pinmap") {
-  if ($reading eq "pinmap") {
+  if ($reading eq "pinMap") {
     $ret .= "pin mapping:\n";
     foreach (sort keys %ESPEasy_pinMap) {
       $ret .= $_." " x (5-length $_ ) ."=> $ESPEasy_pinMap{$_}\n";
@@ -645,38 +653,46 @@ sub ESPEasy_httpRequest($$$$$@)
 {
   my ($hash, $ip, $port, $ident, $cmd, @params) = @_;
   my ($name,$type,$self) = ($hash->{NAME},$hash->{TYPE},ESPEasy_whoami()."()");
+  my $orgParams = join(",",@params);
+  my $orgCmd = $cmd;
   my $url;
+  Log3 $name, 5, "$type $name: httpRequest(ip:$ip, port:$port, ident:$ident, cmd:$cmd, params:$orgParams)";
+
+  if ($cmd eq "raw") {
+    $cmd = $params[0];
+    splice(@params,0,1);
+  }
+  $params[0] = ",".$params[0] if $params[0];
   my $plist = join(",",@params);
-  Log3 $name, 5, "$type $name: httpRequest(ip:$ip, port:$port, ident:$ident, cmd:$cmd, params:".join(" ",@params).")";
-#  Log3 $name, 4, "$type $name: request $ident $cmd $plist";
 
   if ($cmd eq "presencecheck"){
     $url = "http://".$ip.":".$port."/config";
   }
   else {
-    $cmd = $cmd."," if $params[0];
     $url = "http://".$ip.":".$port.$hash->{helper}{urlcmd}.$cmd.$plist;
   }
+  
   Log3 $name, 3, "$type $name: send $cmd$plist to $ident" if ($cmd !~ /^(status|presencecheck)/);
   Log3 $name, 5, "$type $name: URL: $url";
 
+  my $timeout = AttrVal($name,"httpReqTimeout",10);
   my $httpParams = {
     url         => $url,
-    timeout     => 10,
+    timeout     => $timeout,
     keepalive   => 0,
     httpversion => "1.0",
     hideurl     => 0,
     method      => "GET",
-    hash        => $hash,
-    cmd         => $cmd,    # passthrought to parseFn;
-    plist       => $plist,  # passthrought to parseFn;
-    host        => $ip,     # passthrought to parseFn;
-    port        => $port,   # passthrought to parseFn;
-    ident       => $ident,  # passthrought to parseFn;
+    hash        => $hash,      # passthrought to parseFn;
+    cmd         => $orgCmd,    # passthrought to parseFn;
+    plist       => $orgParams, # passthrought to parseFn;
+    host        => $ip,        # passthrought to parseFn;
+    port        => $port,      # passthrought to parseFn;
+    ident       => $ident,     # passthrought to parseFn;
     callback    =>  \&ESPEasy_httpRequestParse
   };
   Log3 $name, 5, "$type $name: HttpUtils_NonblockingGet(ident:$ident host:$ip".
-                 "port:$port cmd:$cmd $plist:$plist)";
+                 "port:$port timeout:$timeout cmd:$cmd $plist:$plist)";
   HttpUtils_NonblockingGet($httpParams);
 
   return undef;
@@ -1075,7 +1091,7 @@ sub ESPEasy_Attr(@)
     Log3 $name, 1, "$type $name: attribut '$aName' can not be used by bridge";
     return "$type: attribut '$aName' can not be used by bridge";  
   }
-  elsif ($aName =~/^(autocreate|authentication)$/
+  elsif ($aName =~/^(autocreate|authentication|httpReqTimeout)$/
     && $hash->{SUBTYPE} eq "device"){
     Log3 $name, 1, "$type $name: attribut '$aName' can be used with the bridge device, only";
     return "$type: attribut '$aName' can be used with the bridge device, only";
@@ -1138,6 +1154,13 @@ sub ESPEasy_Attr(@)
     }
   }
 
+  elsif ($aName eq "httpReqTimeout") {
+    if ($cmd eq "set" && ($aVal < 0 || $aVal > 60)) {
+      $ret ="3..60";
+    }
+  }
+
+
   if (defined $ret) {
     Log3 $name, 2, "$type $name: attr $name $aName $aVal != $ret";
     return "$aName must be: $ret";
@@ -1145,6 +1168,7 @@ sub ESPEasy_Attr(@)
 
   return undef;
 }
+
 
 
 # ------------------------------------------------------------------------------
@@ -1176,7 +1200,7 @@ sub ESPEasy_whoami()  {return (split('::',(caller(1))[3]))[1] || '';}
       libjson-perl or perl-JSON.
       </li>
   </ul>
-
+<br>
   <a name="ESPEasydefine"></a>
   <b>Define </b>(bridge device)<br>
 <br>
@@ -1269,31 +1293,13 @@ eg. : <code>set ESPBridge pass secretpass</code><br>
 <hr>
 <br>
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
   <a name="ESPEasydefine"></a>
   <b>Define </b>(logical device)<br><br>
   <ul>
   Note: logical devices will be created automatically if any values are received
   by the bridge device and autocreate is not disabled. If you configured your
   ESP in a way that no data is send independently then you have to define
-  logical devices.
+  logical devices. At least wifi rssi value could be defined to use autocreate.
   
   <br><br>
   
@@ -1392,6 +1398,15 @@ Direct PWM control of output pins
 <br>
 required arguments: <code>&lt;pin&gt; &lt;level&gt;</code><br>
 see <a href="http://www.esp8266.nu/index.php/GPIO">ESPEasy:GPIO</a> for details
+<br>
+</li>
+<br>
+
+<li>PWMFADE<br>
+PWMFADE control of output pins 
+<br>
+required arguments: <code>&lt;pin&gt; &lt;target&gt; &lt;duration&gt;</code><br>
+pin: 0-3 (0=r,1=g,2=b,3=w), target: 0-1023, duration: 1-30 seconds.
 <br>
 </li>
 <br>
@@ -1506,6 +1521,14 @@ see <a href="http://www.esp8266.nu/index.php/PCF8574">ESPEasy:PCF8574</a>
 </li>
 <br>
 
+<li>raw<br>
+Can be used for own ESP plugins that are not considered at the moment.
+<br>
+Usage: raw &lt;cmd&gt; &lt;param1&gt; &lt;param2&gt; &lt;...&gt;<br>
+eg: raw myCommand 3 1 2
+</li>
+<br>
+
 <li>status<br>
 Request esp device status (eg. gpio)
 <br>
@@ -1583,9 +1606,6 @@ required values: <code>&lt;none&gt;</code><br>
       </li><br>
 
   </ul>
-
-
-
 
 </ul>
 
