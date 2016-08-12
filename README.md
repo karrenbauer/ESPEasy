@@ -36,7 +36,7 @@ More information about FHEM update can be found here:
 0.1.3 - added internal VERSION
       - moved internal URLCMD to $hash->{helper}
       - added pin mapping for Wemos D1 mini, NodeMCU, ... 
-      - within set commands
+        within set commands
       - added state mapping (on->1 off->0) within all set commands
       - added set command "clearReadings" (GPIO readings will be wiped out)
       - added get command "pinMap" (displays pin mapping)
@@ -53,7 +53,9 @@ More information about FHEM update can be found here:
       - approved logging to better fit dev guide lines
       - handle renaming of devices
       - commands are case sensitive again, sorry :(
-0.2.3 - released
+0.2.3 - added pwmfade command #https://forum.fhem.de/index.php/topic,55728.msg480966.html#msg480966
+      - added raw command to send own commands to esp. 
+        usage: 'raw <newCommand> <param1> <param2> <...>'
       
 ```
 
