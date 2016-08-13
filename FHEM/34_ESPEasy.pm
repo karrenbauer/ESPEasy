@@ -62,6 +62,9 @@
 #                      usage: 'raw <newCommand> <param1> <param2> <...>'
 # 2016-08-12  0.2.4  - code cleanup
 #                    - fixed "use TcpServerUtils"
+#                    - removed controls_ESPEasy.txt from dev version
+# 2016-08-13  0.2.5  - fixed PERL WARNING: keys on reference is experimental
+#                      for perl versions >= 5.20
 #             
 #
 #   Credit goes to:
@@ -77,7 +80,7 @@ use Data::Dumper;
 use TcpServerUtils;
 use HttpUtils;
 
-my $ESPEasy_version = "0.2.4";
+my $ESPEasy_version = "0.2.5";
 my $ESPEasy_desc    = 'Control ESP8266/ESPEasy';
 
 sub ESPEasy_Initialize($);
@@ -883,7 +886,7 @@ sub ESPEasy_deleteReadings($;$)
 
   else {
     my @dr;
-    my @r = keys $hash->{READINGS};
+    my @r = keys %{$hash->{READINGS}};
     foreach my $r (@r) {
       next if $r =~ m/^(presence|state)$/;
       CommandDeleteReading(undef, "$name $r");
