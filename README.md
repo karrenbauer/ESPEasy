@@ -1,21 +1,9 @@
 # ESPEasy
 ### FHEM Module To Control ESPEasy
 
-To bind this module into FHEM update service use the FHEM following commands:
-* `update add https://raw.githubusercontent.com/ddtlabs/ESPEasy/develop/controls_ESPEasy.txt`
-* `update` 
+Developer branch
 
-To remove this module from FHEM update service use the FHEM following command:
-* `update delete https://raw.githubusercontent.com/ddtlabs/ESPEasy/develop/controls_ESPEasy.txt`
-
-To install only once (no automatic updates via FHEM update command):
-* `update all https://raw.githubusercontent.com/ddtlabs/ESPEasy/develop/controls_ESPEasy.txt`
-
-Or just download the module and copy it to your FHEM-Modul folder.
-
-More information about FHEM update can be found here:
-[FHEMWIKI](http://www.fhemwiki.de/wiki/Update) [FHEM command reference](http://fhem.de/commandref.html#update)
-
+Download the module and copy it to your FHEM-Modul folder.
 
 ### Release Notes:
 ```
@@ -56,6 +44,8 @@ More information about FHEM update can be found here:
 0.2.3 - added pwmfade command #https://forum.fhem.de/index.php/topic,55728.msg480966.html#msg480966
       - added raw command to send own commands to esp. 
         usage: 'raw <newCommand> <param1> <param2> <...>'
+0.2.4  - code cleanup
+       - fixed "use TcpServerUtils"
       
 ```
 
