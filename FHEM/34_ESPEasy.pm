@@ -64,7 +64,19 @@
 #                    - fixed "use TcpServerUtils"
 #                    - removed controls_ESPEasy.txt from dev version
 # 2016-08-13  0.2.5  - fixed PERL WARNING: keys on reference is experimental
-#                      for perl versions >= 5.20
+#                      for perl versions >= 5.20?
+# 2016-08-20  0.3.0  - process json data only (ESPEasy Version Rxxx required)
+#             0.3.1  - added uniqIDs attribut
+#                    - added get user/pass
+# 2016-08-22  0.3.2  - fixed auth bug
+# 2016-08-24  0.3.3  - state will contain readingvals
+#                    - default room for bridge is ESPEasy, too.
+#                    - Log outdated ESPEasy (without json) once.
+#                    - eval JSON decoding
+# 2016-08-26  0.3.4  - ESP parameter -> Internals
+# 2016-08-27  0.3.5  - dispatch ESP paramater to device internals if changed
+#                    - added attribute setState (disable value mapping to state)
+# 2016-08-27  0.4.0  - code cleanup
 #             
 #
 #   Credit goes to:
@@ -77,42 +89,13 @@ package main;
 use strict;
 use warnings;
 use Data::Dumper;
+use MIME::Base64;
 use TcpServerUtils;
 use HttpUtils;
 
-my $ESPEasy_version = "0.2.5";
-my $ESPEasy_desc    = 'Control ESP8266/ESPEasy';
-
-sub ESPEasy_Initialize($);
-sub ESPEasy_Define($$);
-sub ESPEasy_Get($@);
-sub ESPEasy_Set($$@);
-sub ESPEasy_Read($);
-sub ESPEasy_Write($$$$@);
-sub ESPEasy_dispatch($$@);
-sub ESPEasy_dispatchParse($$$);
-sub ESPEasy_httpRequest($$$$$@);
-sub ESPEasy_httpRequestParse($$$);
-sub ESPEasy_statusRequest($);
-sub ESPEasy_TcpServer_Open($);
-sub ESPEasy_Header2Hash($);
-sub ESPEasy_sendHttpClose($$);
-sub ESPEasy_resetTimer($;$);
-sub ESPEasy_deleteReadings($;$);
-sub ESPEasy_paramPos($$);
-sub ESPEasy_autocreate($$$$);
-sub ESPEasy_isAutosaveEnabled($);
-sub ESPEasy_isAutocreateEnabled($);
-sub ESPEasy_isPmInstalled($$);
-sub ESPEasy_isAuthenticationRequired($);
-sub ESPEasy_isIPv4($);
-sub ESPEasy_isFqdn($);
-sub ESPEasy_Undef($$);
-sub ESPEasy_Shutdown($);
-sub ESPEasy_Delete($$);
-sub ESPEasy_Rename();
-sub ESPEasy_Attr(@);
-sub ESPEasy_whoami();
+my $ESPEasy_version         = "0.4 RC1";
+my $ESPEasy_minESPEasyBuild = 126;
+my $ESPEasy_minJsonVersion  = 1.0;
 
 # ------------------------------------------------------------------------------
 # "setCmds" => "min. number of parameters"
@@ -221,6 +204,7 @@ sub ESPEasy_Initialize($)
   $hash->{ShutdownFn}   = "ESPEasy_Shutdown";
   $hash->{DeleteFn}     = "ESPEasy_Delete";
   $hash->{RenameFn}     = "ESPEasy_Rename";
+#  $hash->{NotifyFn}     = "ESPEasy_Notify";
 
   #bridge
   $hash->{ReadFn}       = "ESPEasy_Read";  #http request from ESPs will be parsed here
@@ -244,6 +228,9 @@ sub ESPEasy_Initialize($)
                         ."readingPrefixGPIO "
                         ."readingSuffixGPIOState "
                         ."httpReqTimeout "
+                        ."uniqIDs:1,0 "
+                        ."setState:1,0 "
+                        ."debug:0,1 "
                         .$readingFnAttributes;
 }
 
@@ -279,20 +266,35 @@ sub ESPEasy_Define($$)  # only called when defined, not on reload.
     return "ERROR: invalid IPv4 address, fqdn or keyword bridge: '$host'"
   }
 
-  $hash->{PORT} = $port;
-  $hash->{IDENT} = $ident if defined $ident;
-  $hash->{VERSION} = $ESPEasy_version;
-  $hash->{helper}{urlcmd} = "/control?cmd=";
-  $hash->{helper}{noPm_JSON} = 1 if (ESPEasy_isPmInstalled($hash,"JSON"));
+  return "ERROR: perl module JSON is not installed" if (ESPEasy_isPmInstalled($hash,"JSON"));
+  #$hash->{helper}{noPm_JSON} = 1 if (ESPEasy_isPmInstalled($hash,"JSON"));
 
+  $hash->{PORT}      = $port;
+  $hash->{IDENT}     = $ident if defined $ident;
+  $hash->{MODULE_VERSION}   = $ESPEasy_version;
+#  $hash->{NOTIFYDEV} = "global,$type";
+  $hash->{helper}{urlcmd} = "/control?cmd=";
+  
   if ($hash->{HOST} eq "bridge") {
     $hash->{SUBTYPE} = "bridge";
     $modules{ESPEasy}{defptr}{BRIDGE} = $hash;
     Log3 $hash->{NAME}, 2, "$type $name: opened as bridge -> port:$port (v$ESPEasy_version)";
-    ESPEasy_TcpServer_Open($hash);
+    ESPEasy_tcpServer_Open($hash);
+    if (not defined getKeyValue($type."_".$name."-firstrun")) {
+      CommandAttr(undef,"$name room $type");
+      CommandAttr(undef,"$name group $type Bridge");
+      setKeyValue($type."_".$name."-firstrun","done");
+    }
+
+    # only informational 
+    my $u = getKeyValue($type."_".$name."-user");
+    $hash->{USER} = (defined $u) ? $u : "not defined yet !!!";
+    my $p = getKeyValue($type."_".$name."-pass");
+    $hash->{PASS} = (defined $p) ? "*" x length($p) : "not defined yet !!!";
+    
     return undef;
-  }
-  else {
+
+  } else {
     $hash->{SUBTYPE} = "device";
   }
 
@@ -318,11 +320,16 @@ sub ESPEasy_Get($@)
   my $reading = $a[1];
   my $ret;
   if (lc $reading eq "pinmap") {
-#  if ($reading eq "pinMap") {
     $ret .= "pin mapping:\n";
     foreach (sort keys %ESPEasy_pinMap) {
       $ret .= $_." " x (5-length $_ ) ."=> $ESPEasy_pinMap{$_}\n";
     }
+    return $ret;
+  }
+
+  elsif (lc $reading =~ /(user|pass)/) {
+    $ret .= "$reading:\n";
+    $ret .= getKeyValue($hash->{TYPE}."_".$hash->{NAME}."_".$reading);
     return $ret;
   }
 
@@ -341,7 +348,8 @@ sub ESPEasy_Get($@)
       $ret .= " $reading:noArg";
     }
     
-    return ($hash->{SUBTYPE} eq "bridge") ? $ret : $ret . " pinMap:noArg";
+    return ($hash->{SUBTYPE} eq "bridge") ? $ret . " user:noArgs pass:noArgs" 
+                                          : $ret . " pinMap:noArg";
   }
 }
 
@@ -355,9 +363,11 @@ sub ESPEasy_Set($$@)
 
   return if (IsDisabled $name);
 
-  Log3 $name, 3, "$type $name: set $name $cmd ".join(" ",@params) if $cmd ne "?";
+  Log3 $name, 3, "$type $name: set $name $cmd ".join(" ",@params) 
+    if $cmd !~  m/^(\?|user|pass)$/;
+#    if $cmd ne "?";
 
-  # ----- BRDIGE --------
+  # ----- BRDIGE ----------------------------------------------
   if ($hash->{SUBTYPE} eq "bridge") {
 
     # are there all required argumets?
@@ -383,14 +393,18 @@ sub ESPEasy_Set($$@)
     }
 
     elsif ($cmd =~ /^user|pass$/ ) {
-      setKeyValue($hash->{TYPE}."_".$hash->{NAME}."_".$cmd,$params[0]);
+      setKeyValue($hash->{TYPE}."_".$hash->{NAME}."-".$cmd,$params[0]);
+      # only informational 
+      if (defined $params[0]) {
+        $hash->{uc($cmd)} = ($cmd eq "user") ? $params[0] : "*" x length($params[0]);
+      } else {
+        $hash->{uc($cmd)} = "not defined yet !!!";
+      }
     }
+  }
 
-  } # ----- BRDIGE --------
-  
-  # ----- DEVICE --------
+  # ----- DEVICE ----------------------------------------------
   else {
-
 
     # are there all required argumets?
     if($ESPEasy_setCmds{$cmd} && scalar @params < $ESPEasy_setCmds{$cmd}) {
@@ -440,7 +454,8 @@ sub ESPEasy_Set($$@)
       return undef;
     }
 
-    Log3 $name, 5, "$type $name: IOWrite($hash, $hash->{HOST}, $hash->{PORT}, $hash->{IDENT}, $cmd, ".join(",",@params).")";
+    Log3 $name, 5, "$type $name: IOWrite($hash, $hash->{HOST}, $hash->{PORT}, ".
+                   "$hash->{IDENT}, $cmd, ".join(",",@params).")";
     IOWrite($hash, $hash->{HOST}, $hash->{PORT}, $hash->{IDENT}, $cmd, @params);
 
   } # DEVICE
@@ -461,7 +476,7 @@ sub ESPEasy_Read($) {
   # Accept and create a child
   if( $hash->{SERVERSOCKET} ) {
     my $aRet = TcpServer_Accept( $hash, "ESPEasy" );
-    $bhash->{PEER} = $aRet->{PEER};
+    $bhash->{helper}{PEER} = $aRet->{PEER};
     Log3 $bname, 5, "$btype $bname: accepted tcp connect <= ".$aRet->{PEER}.":".$aRet->{PORT};
     return;
   }
@@ -476,51 +491,127 @@ sub ESPEasy_Read($) {
     return;
   }
 
-  Log3 $bname, 5, "$btype $bname: received raw message: \n$buf" ;
-
-  my @data = split( '\R\R', $buf );
-  my $header = ESPEasy_Header2Hash($data[0]);
-  Log3 $bname, 5, "$btype $bname: Dumper \$header: \n".Dumper($header);
-
-  if (ESPEasy_isAuthenticationRequired($bhash)){
-    use MIME::Base64;
-    my $u = getKeyValue($btype."_".$bname."_user");
-    my $p = getKeyValue($btype."_".$bname."_pass");
-    if (defined $header->{Authorization}) {
-      my ($a,$v) = split(" ",$header->{Authorization});
-      if ($a eq "Basic" && decode_base64($v) eq $u.":".$p){
-        Log3 $bname, 5, "$btype $bname: authentication accepted";
-      }
-    }
-    else {
-      Log3 $bname, 2, "$btype $bname: basic authentication enabled, but no or invalid authentication type received";
-      return;
-    }
-  }
-  elsif (defined $header->{Authentication}) {
-      Log3 $bname, 2, "$btype $bname: no basic authentication required but received such header from $bhash->{PEER}";
-  } 
-
-  my @cmds;
-  if ($header->{GET} =~ s/cmd=(.*) HTTP//) {
-    @cmds = split("%3B",$1); # "%3B" == ";"
-    foreach (@cmds) {
-      my ($cmd,$device,$reading,$value) = split("%20",$_);
-      Log3 $bname, 4, "$btype $bname: received cmd:$cmd device:$device reading:$reading value:$value";
-    }
-  }
-  else {
-    Log3 $bname, 2, "$btype $bname: received invalid data";
-    Log3 $bname, 5, "$btype $bname: received:\n$buf";
-    ESPEasy_sendHttpClose($hash->{CD},"");
-    return;
-  }
   ESPEasy_sendHttpClose($hash->{CD},"");
 
-  ESPEasy_dispatch($bhash,$bhash->{PEER},@cmds);
-  delete $bhash->{PEER};
+  return if (IsDisabled $bname);      ### check
+  
+  Log3 $bname, 5, "$btype $bname: received raw message: \n$buf"
+    if AttrVal($bname,"debug","0");
 
-return;
+  my @data = split( '\R\R', $buf );
+  my $header = ESPEasy_header2Hash($data[0]);
+  
+  Log3 $bname, 5, "$btype $bname: Dumper \$header: \n".Dumper($header)
+    if AttrVal($bname,"debug","0");
+  Log3 $bname, 1, "$btype $bname: Dumper \$content: \n".Dumper($data[1]) 
+    if defined $data[1] && AttrVal($bname,"debug","0");
+
+  if ($header->{'Content-Length'} != length($data[1])) {
+    Log3 $bname, 1, "$btype $bname: Invalid content length ".
+                    "($header->{'Content-Length'} != ".length($data[1]).")";
+    return;
+  }
+
+  return if !defined ESPEasy_isAuthenticated($bhash,
+                                             $header->{Authorization},
+                                             $bhash->{helper}{PEER}
+                                            );
+
+  if (defined $data[1] && $data[1] =~ m/"module":"ESPEasy"/) {
+
+    delete $bhash->{helper}{outdated}{$bhash->{helper}{PEER}}
+      if exists $bhash->{helper}{outdated}{$bhash->{helper}{PEER}};
+
+    $data[1] =~ s/[^A-Za-z\d_\.\-\/\{}:,"]/_/g;
+
+#    use JSON;
+    my $json;
+    eval {$json = decode_json($data[1]);1;};
+    if ($@) {
+      Log3 $bname, 2, "$btype $bname: Check your ESP config, the following error occurred:";
+      Log3 $bname, 2, "$btype $bname: $@";
+      return;
+    }
+    
+    Log3 $bname, 5, "$btype $bname: Dumper \$content decoded: \n".Dumper($json)
+      if AttrVal($bname,"debug","0");
+
+    ESPEasy_checkVersions($bhash,
+                          $json->{data}{ESP}{name},
+                          $json->{data}{ESP}{build},
+                          $json->{version}
+                         );
+ 
+    my @cmds;
+    my @idents;
+    my $uniqIDs = AttrVal($bname,"uniqIDs",1) ? $json->{data}{ESP}{name}."_" : "";
+
+    #push sensor value in @cmds
+    foreach my $vKey (keys %{$json->{data}{SENSOR}}) {
+      if(ref $json->{data}{SENSOR}{$vKey} eq ref {} && exists $json->{data}{SENSOR}{$vKey}{value}) {
+        my $dmsg = "setreading::".
+                   $uniqIDs.
+                   $json->{data}{SENSOR}{$vKey}{deviceName}."::".
+                   $json->{data}{SENSOR}{$vKey}{valueName}."::".
+                   $json->{data}{SENSOR}{$vKey}{value};
+        if ($dmsg =~ m/(::::)|(::$)/) {
+          Log3 $bname, 2, "$btype $bname: WARNING: device name, value name or value not received ($bhash->{helper}{PEER}). Skipping data.";
+          next ;
+        }
+        push(@cmds,$dmsg);
+        push(@idents,$uniqIDs.$json->{data}{SENSOR}{$vKey}{deviceName});
+      }
+    }
+
+    #push ESP values in @cmds if they have changed
+    my $ip = $bhash->{helper}{PEER};
+    my @intVals = qw(unit sleep build);
+    my @uniqID = do { my %seen; grep { !$seen{$_}++ } @idents };
+    foreach my $intVal (@intVals) {
+      foreach my $ident (@uniqID) { 
+        if (not(defined $bhash->{helper}{uniqID}{$ident}{$ip}{$intVal}) 
+           || $bhash->{helper}{uniqID}{$ident}{$ip}{$intVal} ne $json->{data}{ESP}{$intVal}) {
+          $bhash->{helper}{uniqID}{$ident}{$ip}{$intVal} = $json->{data}{ESP}{$intVal};
+          push(@cmds,"setinternal::".$ident."::".uc($intVal)."::".$json->{data}{ESP}{$intVal});
+        }
+      }
+    }
+    ESPEasy_dispatch($bhash,$bhash->{helper}{PEER},@cmds);
+  } #$data[1] =~ m/"module":"ESPEasy"/
+
+# --------- deprecated begin ----------
+  # no valid json => old setreading version
+  elsif (defined $header->{GET} && $header->{GET} =~ m/cmd=(.*) HTTP/) 
+  {
+    return if $1 !~ /^setreading%20(.*)%20(.*)%20(.*)/;
+    my @cmds;
+    my @converted;
+    my ($cmd,$device,$reading,$value);
+    if ($header->{GET} =~ s/cmd=(.*) HTTP//) {
+      @cmds = split("%3B",$1); # "%3B" == ";"
+      foreach (@cmds) {
+        ($cmd,$device,$reading,$value) = split("%20",$_);
+        push(@converted,"$cmd::$device::$reading::$value");
+        Log3 $bname, 4, "$btype $bname: received cmd:$cmd device:$device reading:$reading value:$value";
+      }
+      if (not defined $bhash->{helper}{outdated}{$bhash->{helper}{PEER}}) {
+        $bhash->{helper}{outdated}{$bhash->{helper}{PEER}} = 1;
+        Log3 $bname, 2, "$btype $bname: No or invalid json data received from ".
+                        "$bhash->{helper}{PEER}. ESPEasy build must be >= ".
+                        "R".$ESPEasy_minESPEasyBuild;
+        Log3 $bname, 2, "$btype $bname: Please update, this version is no ".
+                        "longer supported!";
+      }
+    }
+    ESPEasy_dispatch($bhash,$bhash->{helper}{PEER},@converted);
+  }
+# --------- deprecated end ----------
+
+  else {
+  }
+  
+  delete $bhash->{helper}{PEER};
+  return;
 }
 
 
@@ -540,462 +631,126 @@ sub ESPEasy_Write($$$$@) #called from logical's IOWrite (end of SetFn)
 
 
 # ------------------------------------------------------------------------------
-sub ESPEasy_dispatch($$@) #called by bridge -> send to logical devices
+sub ESPEasy_Notify($$)
 {
-  my($hash,$ip,@cmds) = @_;
-  my $name = $hash->{NAME};
-  my @msg;
-  my ($fhemcmd,$device,$reading,$value);
-  
-  foreach my $cmd (@cmds) {
-    ($fhemcmd,$device,$reading,$value) = split("%20",$cmd);
-    push( @msg, "$fhemcmd|$reading|$value");
-  }
-   
-  my $as = ESPEasy_isAutosaveEnabled($hash);
-  my $ac = ESPEasy_isAutocreateEnabled($hash);
-  my $msg = "$device:$ip:$ac:$as:".join("||",@msg);
-  Dispatch($hash, $msg, undef);
+  my ($hash,$dev) = @_;
+  my $name  = $hash->{NAME};
+
+  return if ($dev->{NAME} =~  /^(global|$hash->{NAME}$/);
+  return if (!grep(m/^INITIALIZED|REREADCFG$/, @{$dev->{CHANGED}}));
+
+  return undef if( AttrVal($name, "disable", 0) );
 
   return undef;
 }
 
 
 # ------------------------------------------------------------------------------
-sub ESPEasy_dispatchParse($$$) #called by logical device  (defined by $hash->{ParseFn})
-{
-  # we are called from dispatch() from the ESPEasy bridge device
-  # we never come here if $msg does not match $hash->{MATCH} in the first place
-  my ($IOhash, $msg) = @_;   # IOhash points to the ESPEasy bridge, not to client devices
-  my ($IOname,$type,$self) = ($IOhash->{NAME},$IOhash->{TYPE},ESPEasy_whoami()."()");
-
-  # 1:ident (ESP Name) 2:ip 3:autocreate 4:autosave 5:data
-  my ($ident,$ip,$ac,$as,$v) = split(":",$msg);
-  Log3 undef, 5, "$type $IOname: $self got: $msg";
-  return undef if !$ident || $ident eq "";
-
-  my $name;
-  my @v = split("\\|\\|",$v);
-  # look in each $defs{$d}{IDENT} for $ident to get device name.
-  foreach my $d (keys %defs) {
-    next if($defs{$d}{TYPE} ne "ESPEasy");
-    if (InternalVal($defs{$d}{NAME},"IDENT","") eq "$ident") {
-      $name = $defs{$d}{NAME} ;
-      last;
-    }
-  }
-
-  # autocreate device if IDENT has no device asigned.
-  $name = ESPEasy_autocreate($IOhash,$ident,$ip,$as) if (!($name) && $ac eq "1");
-  
-  my $hash = $defs{$name};
-
-  if (defined $hash && $hash->{TYPE} eq "ESPEasy" && $hash->{SUBTYPE} eq "device") {
-    foreach (@v) {
-      my ($fhemcmd,$reading,$value) = split("\\|",$_);
-
-      # reading prefix replacement
-      my $replace = '"'.AttrVal($name,"readingPrefixGPIO","GPIO").'"';
-      $reading =~ s/^GPIO/$replace/ee;
-
-      if ($fhemcmd eq "setreading") {
-        # reading suffix replacement only for setreading
-        $replace = '"'.AttrVal($name,"readingSuffixGPIOState","").'"';
-        $reading =~ s/_state$/$replace/ee;
-        readingsSingleUpdate($hash, $reading, $value, 1);
-        Log3 $name, 4, "$type $name: $reading: $value";
-      }
-
-      elsif ($fhemcmd eq "deletereading") {
-        my $dr = CommandDeleteReading(undef, "$name $reading");
-        Log3 $name, 4, "$type $name: reading $reading deleted" if $dr ne "";
-      }
-
-    }
-  }
-  else {
-    Log3 undef, 2, "ESPEasy: Device $name not defined";
-  }
- 
-  return $name;  # must be != undef. else msg will processed further -> help me!
-}
-
-
-# ------------------------------------------------------------------------------
-sub ESPEasy_autocreate($$$$)
-{
-  my ($IOhash,$ident,$ip,$autosave) = @_;
-  my $IOname = $IOhash->{NAME};
-  my $IOtype = $IOhash->{TYPE};
-
-  my $devname = "ESPEasy_".$ident;
-  my $define  = "$devname ESPEasy $ip 80 $IOhash->{NAME} $ident";
-  Log3 undef, 2, "$IOtype $IOname: autocreate $define";
-
-  my $cmdret= CommandDefine(undef,$define);
-  if(!$cmdret) {
-    $cmdret= CommandAttr(undef, "$devname room $IOhash->{TYPE}");
-#    $cmdret= CommandAttr(undef, "$devname devStateIcon {ESPEasy_devStateIcon()}");
-    if (defined $autosave && $autosave eq "1") {
-      CommandSave(undef,undef);
-      Log3 undef, 2, "$IOtype $IOname: structural changes saved.";
-    } 
-    else {
-      Log3 undef, 2, "$IOtype $IOname: autosave disabled: do not forget to save changes.";
-    }
-  }
-  else {
-    Log3 undef, 1, "$IOtype $IOname: an autocreate error occurred while creating device for $ident: $cmdret";
-  } 
-
-  return $devname;
-}
-
-
-# ------------------------------------------------------------------------------
-sub ESPEasy_httpRequest($$$$$@)
-{
-  my ($hash, $ip, $port, $ident, $cmd, @params) = @_;
-  my ($name,$type,$self) = ($hash->{NAME},$hash->{TYPE},ESPEasy_whoami()."()");
-  my $orgParams = join(",",@params);
-  my $orgCmd = $cmd;
-  my $url;
-  Log3 $name, 5, "$type $name: httpRequest(ip:$ip, port:$port, ident:$ident, cmd:$cmd, params:$orgParams)";
-
-  if ($cmd eq "raw") {
-    $cmd = $params[0];
-    splice(@params,0,1);
-  }
-
-  $params[0] = ",".$params[0] if $params[0];
-  my $plist = join(",",@params);
-
-  if ($cmd eq "presencecheck"){
-    $url = "http://".$ip.":".$port."/config";
-  }
-  else {
-    $url = "http://".$ip.":".$port.$hash->{helper}{urlcmd}.$cmd.$plist;
-  }
-  
-  Log3 $name, 3, "$type $name: send $cmd$plist to $ident" if ($cmd !~ /^(status|presencecheck)/);
-  Log3 $name, 5, "$type $name: URL: $url";
-
-  my $timeout = AttrVal($name,"httpReqTimeout",10);
-  my $httpParams = {
-    url         => $url,
-    timeout     => $timeout,
-    keepalive   => 0,
-    httpversion => "1.0",
-    hideurl     => 0,
-    method      => "GET",
-    hash        => $hash,      # passthrought to parseFn;
-    cmd         => $orgCmd,    # passthrought to parseFn;
-    plist       => $orgParams, # passthrought to parseFn;
-    host        => $ip,        # passthrought to parseFn;
-    port        => $port,      # passthrought to parseFn;
-    ident       => $ident,     # passthrought to parseFn;
-    callback    =>  \&ESPEasy_httpRequestParse
-  };
-  Log3 $name, 5, "$type $name: HttpUtils_NonblockingGet(ident:$ident host:$ip".
-                 "port:$port timeout:$timeout cmd:$cmd $plist:$plist)";
-  HttpUtils_NonblockingGet($httpParams);
-
-  return undef;
-}
-
-
-# ------------------------------------------------------------------------------
-sub ESPEasy_httpRequestParse($$$)
-{
-  my ($param, $err, $data) = @_;
-  my $hash = $param->{hash};
-  my ($name,$type,$self) = ($hash->{NAME},$hash->{TYPE},ESPEasy_whoami());
-  my @dispatchCmd;
-  
-  if ($err ne "") {
-    if ($hash->{helper}{$param->{host}}{presence} ne "absent") {
-      Log3 $name, 2, "$type $name: $param->{ident} error: $err";
-    }
-    $hash->{helper}{$param->{host}}{presence} = "absent";
-    push @dispatchCmd, "deletereading"."%20".$param->{ident}."%20"."GPIO.*"."%20"."undef";
-    push @dispatchCmd, "setreading"."%20".$param->{ident}."%20"."presence"."%20"."absent";
-  }
-
-  elsif ($data ne "") 
-  { 
-    $hash->{helper}{$param->{host}}{presence} = "present";
-    push @dispatchCmd, "setreading%20".$param->{ident}."%20"."presence"."%20"."present";
-
-    if ($param->{cmd} =~ /^(presencecheck)$/) {
-      ESPEasy_dispatch($hash,$param->{host},@dispatchCmd);
-      return undef;
-    }
-
-    # no errors occurred
-    Log3 $name, 5, "$type $name: $self() data: \n$data";
-    if (!defined $hash->{helper}{noPm_JSON}) {
-      if ($data =~ /^{/) { #it is json...
-        use JSON;
-        my %res = %{decode_json($data)};
-        Log3 $name, 5, "$type $name: $param->{cmd}$param->{plist} => mode:$res{mode} state:$res{state}";
-
-        $res{state} = ($res{state} == 1) ? "on" : "off" if $res{mode} =~ /^output|input$/;
-        push @dispatchCmd, "setreading%20".$param->{ident}."%20GPIO".$res{pin}."_mode%20".$res{mode};
-        push @dispatchCmd, "setreading%20".$param->{ident}."%20GPIO".$res{pin}."_state%20".$res{state};
-        push @dispatchCmd, "setreading%20".$param->{ident}."%20_lastAction%20".$res{log} if $res{log} ne "";
-      } #it is json...
-
-      else { # no json returned => unknown state => delete readings
-        Log3 $name, 5, "$type $name: no json fmt: $param->{cmd}$param->{plist} => $data";
-        if ($param->{plist} =~/^gpio,(\d+)/) {
-          push @dispatchCmd, "deletereading"."%20".$param->{ident}."%20"."GPIO$1"."_.*"."%20"."undef";
-
-        }
-      }
-    }
-
-    else { # no json installed
-      Log3 $name, 2, "$type $name: perl module JSON not installed.";
-    }
-  } # ($data ne "") 
-
-  ESPEasy_dispatch($hash,$param->{host},@dispatchCmd);
-
-  return undef;
-}
-
-
-# ------------------------------------------------------------------------------
-sub ESPEasy_statusRequest($) #called by device
-{
-  my ($hash) = @_;
-  my $name = $hash->{NAME};
-  my $type = $hash->{TYPE};
-
-  my $a = AttrVal($name,"pollGPIOs","");
-  my @gpios = split(",",$a);
-  foreach my $gpio (@gpios) {
-
-    # pin mapping (eg. D8 -> 15)
-    if ($gpio =~ /^[a-zA-Z]/) {
-      Log3 $name, 5, "$type $name: pin mapping ".uc $gpio." => $ESPEasy_pinMap{uc $gpio}";
-      $gpio = $ESPEasy_pinMap{uc $gpio};
-    }
-
-    Log3 $name, 5, "$type $name: IOWrite($hash, $hash->{HOST}, $hash->{PORT}, $hash->{IDENT}, status, gpio,".$gpio.")";
-    IOWrite($hash, $hash->{HOST}, $hash->{PORT}, $hash->{IDENT}, "status", "gpio,".$gpio);
-  }
-
-  if ($a eq ""){
-    Log3 $name, 5, "$type $name: IOWrite($hash, $hash->{HOST}, $hash->{PORT}, $hash->{IDENT}, presencecheck)";
-    IOWrite($hash, $hash->{HOST}, $hash->{PORT}, $hash->{IDENT}, "presencecheck", "");
-  }
-
-  ESPEasy_resetTimer($hash);
-  return undef;
-}
-
-
-# ------------------------------------------------------------------------------
-sub ESPEasy_TcpServer_Open($) {
-  my ($hash) = @_;
-  my $name = $hash->{NAME};
-  my $type = $hash->{TYPE};
-
-  my $port = ($hash->{PORT}) ? $hash->{PORT} : 8383;
-
-
-  # Open TCP socket
-  my $ret = TcpServer_Open( $hash, $port, "global" );
-    
-  if( $ret && !$init_done ) {
-    Log3 $name, 2, "$type $name: => $ret. Exiting.";
-    exit(1);
-  }
-    
-  readingsSingleUpdate ( $hash, "state", "opened", 1 );
-    
-  return $ret;
-}
-
-
-# ------------------------------------------------------------------------------
-sub ESPEasy_Header2Hash($) {
-  my ($string) = @_;
-  my %header = ();
-
-  foreach my $line (split("\r\n", $string)) {
-    my ($key,$value) = split(" ", $line,2);
-    next if !$value;
-
-    $value =~ s/^ //;
-    $key =~ s/:$//;
-    $header{$key} = $value;
-  }     
-        
-  return \%header;
-}
-
-
-# ------------------------------------------------------------------------------
-sub ESPEasy_sendHttpClose($$) {
-
-    my ($con,$response) = @_;
-    print $con "HTTP/1.1 200 OK\r\n",
-           "Content-Type: text/plain\r\n",
-           "Connection: close\r\n",
-           "Content-Length: ".length($response)."\r\n\r\n",
-           $response;
-        
-    return undef;
-}
-
-
-# ------------------------------------------------------------------------------
-sub ESPEasy_resetTimer($;$)
-{
-  my ($hash,$sig) = @_;
-  my $name = $hash->{NAME};
-  my $type = $hash->{TYPE};
-  $sig = "" if !$sig;
-
-  Log3 $name, 5, "$type $name: RemoveInternalTimer($hash, ESPEasy_statusRequest)";
-  RemoveInternalTimer($hash, "ESPEasy_statusRequest") if $init_done == 1;
-  
-  return undef if $sig eq "stop";
-    
-  unless(IsDisabled($name)) {
-    Log3 $name, 5, "$type $name: InternalTimer(".gettimeofday()."+".AttrVal($name,"Interval",300)."+".rand(5).", ESPEasy_statusRequest, $hash)";
-    InternalTimer(gettimeofday()+AttrVal($name,"Interval",300)+rand(5), "ESPEasy_statusRequest", $hash);
-  }
-  return undef;
-}
-
-
-# ------------------------------------------------------------------------------
-sub ESPEasy_deleteReadings($;$)
-{
-  my ($hash,$reading) = @_;
-  my ($name,$type) = ($hash->{NAME},$hash->{TYPE});
-
-  if ($reading) {
-    CommandDeleteReading(undef, "$name $reading");
-    Log3 $name, 4, "$type $name: reading $reading wiped out";
-    return undef;
-  } 
-
-  else {
-    my @dr;
-    my @r = keys %{$hash->{READINGS}};
-    foreach my $r (@r) {
-      next if $r =~ m/^(presence|state)$/;
-      CommandDeleteReading(undef, "$name $r");
-      push(@dr,$r);
-    }
-    Log3 $name, 4, "$type $name: readings [".join(",",@dr)."] wiped out" if scalar @dr > 1;
-  }
-
-  return undef;
-}
-
-
-# ------------------------------------------------------------------------------
-sub ESPEasy_paramPos($$)
-{
-  my ($cmd,$search) = @_;
-  my @usage = split(" ",$ESPEasy_setCmdsUsage{$cmd});
-  my $pos = 0;
+sub ESPEasy_Rename() {
+	my ($new,$old) = @_;
   my $i = 0;
+	my $type    = $defs{"$new"}->{TYPE};
+	my $name    = $defs{"$new"}->{NAME};
+	my $subtype = $defs{"$new"}->{SUBTYPE};
 
-  foreach (@usage) {
-    if ($_ eq $search) {
-      $pos = $i;
-      last;
+	setKeyValue($type."_".$new."-user",getKeyValue($type."_".$old."-user"));
+	setKeyValue($type."_".$new."-pass",getKeyValue($type."_".$old."-pass"));
+	setKeyValue($type."_".$new."-firstrun",getKeyValue($type."_".$old."-firstrun"));
+	setKeyValue($type."_".$old."-user",undef);
+	setKeyValue($type."_".$old."-pass",undef);
+	setKeyValue($type."_".$old."-firstrun",undef);
+  Log3 $name, 2, "$type $name: device $old renamed to $new";
+  
+  if ($subtype eq "bridge") {
+    foreach my $ldev (devspec2array("TYPE=$type")) {
+      my $dhash = $defs{$ldev};
+      my $dsubtype = $dhash->{SUBTYPE};
+      next if ($dsubtype eq "bridge");
+      my $dname = $dhash->{NAME};
+      my $ddef  = $dhash->{DEF};
+      my $oddef = $dhash->{DEF};
+      $ddef =~ s/ $old / $new /;
+      if ($oddef ne $ddef){
+        $i = $i+2;
+        CommandModify(undef, "$dname $ddef");
+        CommandAttr(undef,"$dname IODev $new");
+      }
     }
-    $i++;
+  }
+  if (AttrVal($name,"autosave",AttrVal("global","autosave",1)) && $i>0) {
+    CommandSave(undef,undef);
+    Log3 $type, 2, "$type $name: autosave is enabled: $i structural changes saved.";
+  }
+  elsif ($i>0) {
+    Log3 $type, 2, "$type $name: there are $i structural changes. Don't forget to save chages.";
+  }
+	return undef;
+}
+
+
+# ------------------------------------------------------------------------------
+sub ESPEasy_Attr(@)
+{
+  my ($cmd,$name,$aName,$aVal) = @_;
+  my $hash = $defs{$name};
+  my $type = $hash->{TYPE};
+  my $ret = undef;
+
+  if ($aName =~ /(Interval|pollGPIOs|IODev|readingPrefixGPIO|readingSuffixGPIOState|setState)/
+    && $hash->{SUBTYPE} eq "bridge") {
+    Log3 $name, 1, "$type $name: attribut '$aName' can not be used by bridge";
+    return "$type: attribut '$aName' can not be used by bridge";  
+  }
+  elsif ($aName =~/^(autocreate|autosave|authentication|httpReqTimeout)$/
+    && $hash->{SUBTYPE} eq "device"){
+    Log3 $name, 1, "$type $name: attribut '$aName' can be used with the ".
+                   "bridge device, only";
+    return "$type: attribut '$aName' can be used with the bridge device, only";
   }
   
-  return $pos; # return 0 if no match, else position
-}
+  if ($aName eq "disable") {
+    $ret="0,1" if ($cmd eq "set" && not $aVal =~ m/(^0|1$)/);
+    if ($cmd eq "set" && $aVal == 1) {
+      Log3 $name, 3,"$type: $name is disabled";
+      ESPEasy_deleteReadings($hash);
+      ESPEasy_resetTimer($hash,"stop");
+      readingsSingleUpdate($hash, "state", "disabled",1)}
+    elsif ($cmd eq "del" || $aVal == 0) {
+      Log3 $name, 5, "$type $name: InternalTimer(".gettimeofday()."+2,".
+                     "ESPEasy_statusRequest, $hash) ";
+      InternalTimer(gettimeofday()+2, "ESPEasy_resetTimer", $hash) 
+        if $hash->{SUBTYPE} eq "device";
+      readingsSingleUpdate($hash, 'state', 'opened',1)
+    }}
+  elsif ($aName eq "pollGPIOs") {
+    $ret ="GPIO_No[,GPIO_No][...]" if $cmd eq "set" && $aVal !~ /^[a-zA-Z]{0,2}[0-9]+(,[a-zA-Z]{0,2}[0-9]+)*$/}
 
-
-# ------------------------------------------------------------------------------
-sub ESPEasy_isAutosaveEnabled($)
-{
-  my ($hash) = @_;
-  my ($name,$type,$self) = ($hash->{NAME},$hash->{TYPE},ESPEasy_whoami()."()");
-
-  my $module_enabled = AttrVal($name,"autosave",undef);
-  my $global_enabled = AttrVal("global","autosave",undef);
-  
-  return 1 if (defined $module_enabled && $module_enabled eq "1");
-  return 1 if (not(defined $module_enabled) && ((not(defined $global_enabled))
-              || (defined $global_enabled && $global_enabled eq "1")) );
-
-  Log3 $name, 5, "$type $name: autosave is disabled.";
-  return 0;
-}
-
-
-# ------------------------------------------------------------------------------
-sub ESPEasy_isAutocreateEnabled($)
-{
-  my ($hash) = @_;
-  my ($name,$type,$self) = ($hash->{NAME},$hash->{TYPE},ESPEasy_whoami()."()");
-  my $ret = 0;
-
-  my $module_enabled = AttrVal($name,"autocreate",undef);
-  my $global_enabled = AttrVal("global","autoload_undefined_devices",undef);
-  
-  $ret = 1 if (defined $module_enabled && $module_enabled eq "1");
-  $ret = 1 if (not(defined $module_enabled) && ((not(defined $global_enabled))
-              || (defined $global_enabled  && $global_enabled eq "1") ));
-
-  my $enDis = ($ret == 1) ? "enabled" : "disabled";
-  Log3 $name, 5, "$type $name: autocreate is " . $enDis;
-  return $ret;
-}
-
-
-# ------------------------------------------------------------------------------
-sub ESPEasy_isPmInstalled($$)
-{
-  my ($hash,$pm) = @_;
-  my ($name,$type) = ($hash->{NAME},$hash->{TYPE});
-  if (not eval "use $pm;1")
-  {
-    Log3 $name, 1, "$type $name: perl modul missing: $pm. Install it, please.";
-    $hash->{MISSING_MODULES} .= "$pm ";
-    return "failed: $pm";
+  elsif ($aName eq "Interval") {
+    $ret =">10" if $cmd eq "set" && $aVal < 10}
+  elsif ($aName eq "autosave") {
+    $ret="0,1" if ($cmd eq "set" && not $aVal =~ m/^(0|1)$/)}
+  elsif ($aName eq "autocreate") {
+    $ret="0,1" if ($cmd eq "set" && not $aVal =~ m/^(0|1)$/)}
+  elsif ($aName eq "authentication") {
+    $ret="0,1" if ($cmd eq "set" && not $aVal =~ m/^(0|1)$/)}
+  elsif ($aName eq "uniqIDs") {
+    $ret="0,1" if ($cmd eq "set" && not $aVal =~ m/^(0|1)$/)}
+  elsif ($aName eq "setState") {
+    $ret="0,1" if ($cmd eq "set" && not $aVal =~ m/^(0|1)$/)}
+  elsif ($aName eq "readingPrefixGPIO") {
+    $ret="[a-zA-Z0-9._-/]+" if $cmd eq "set" && $aVal !~ m/^[A-Za-z\d_\.\-\/]+$/}
+  elsif ($aName eq "readingSuffixGPIOState") {
+    $ret="[a-zA-Z0-9._-/]+" if ($cmd eq "set" && $aVal !~ m/^[A-Za-z\d_\.\-\/]+$/)}
+  elsif ($aName eq "httpReqTimeout") {
+    $ret ="3..60" if $cmd eq "set" && ($aVal < 3 || $aVal > 60)}
+      
+  if (defined $ret) {
+    Log3 $name, 2, "$type $name: attr $name $aName $aVal != $ret";
+    return "$aName must be: $ret";
   }
+
   return undef;
 }
-
-
-# ------------------------------------------------------------------------------
-sub ESPEasy_isAuthenticationRequired($)
-{
-  my ($hash) = @_;
-  my $name = $hash->{NAME};
-  my $type = $hash->{TYPE};
-
-  my $u = getKeyValue($type."_".$name."_user");
-  my $p = getKeyValue($type."_".$name."_pass");
-  my $a = AttrVal($name,"authentication",undef);
-  if (!defined $u || !defined $p || !defined $u) {
-    return 0;
-  }
-  return 1;
-}
-
-# ------------------------------------------------------------------------------
-sub ESPEasy_isIPv4($) {return if(!defined $_[0]); return 1 if($_[0] 
-  =~ /^(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$/)}
-
-
-# ------------------------------------------------------------------------------
-sub ESPEasy_isFqdn($) {return if(!defined $_[0]); return 1 if($_[0] 
-  =~ /^(?=^.{4,253}$)(^((?!-)[a-zA-Z0-9-]{1,63}(?<!-)\.)+[a-zA-Z]{2,63}$)$/)}
 
 
 # ------------------------------------------------------------------------------
@@ -1033,111 +788,555 @@ sub ESPEasy_Shutdown($)
 sub ESPEasy_Delete($$)
 {
   my ($hash, $arg) = @_;
-  setKeyValue($hash->{TYPE}."_".$hash->{NAME}."_user",undef);
-  setKeyValue($hash->{TYPE}."_".$hash->{NAME}."_pass",undef);
+  setKeyValue($hash->{TYPE}."_".$hash->{NAME}."-user",undef);
+  setKeyValue($hash->{TYPE}."_".$hash->{NAME}."-pass",undef);
+  setKeyValue($hash->{TYPE}."_".$hash->{NAME}."-firstrun",undef);
   Log3 $hash->{NAME}, 5, "$hash->{TYPE} $hash->{NAME}: $hash->{NAME} deleted";
   return undef;
 }
 
 
 # ------------------------------------------------------------------------------
-sub ESPEasy_Rename() {
-	my ($new,$old) = @_;
-  my $i = 0;
-	my $type    = $defs{"$new"}->{TYPE};
-	my $name    = $defs{"$new"}->{NAME};
-	my $subtype = $defs{"$new"}->{SUBTYPE};
-	
-	setKeyValue($type."_".$new."_user",getKeyValue($type."_".$old."_user"));
-	setKeyValue($type."_".$new."_pass",getKeyValue($type."_".$old."_pass"));
-	setKeyValue($type."_".$old."_user",undef);
-	setKeyValue($type."_".$old."_pass",undef);
-  Log3 $name, 2, "$type $name: device $old renamed to $new";
-  
-  if ($subtype eq "bridge") {
-    foreach my $ldev (devspec2array("TYPE=$type")) {
-      my $dhash = $defs{$ldev};
-      my $dsubtype = $dhash->{SUBTYPE};
-      next if ($dsubtype eq "bridge");
-      my $dname = $dhash->{NAME};
-      my $ddef  = $dhash->{DEF};
-      my $oddef = $dhash->{DEF};
-      $ddef =~ s/ $old / $new /;
-      if ($oddef ne $ddef){
-        $i = $i+2;
-        CommandModify(undef, "$dname $ddef");
-        CommandAttr(undef,"$dname IODev $new");
-      }
-    }
+sub ESPEasy_dispatch($$@) #called by bridge -> send to logical devices
+{
+  my($hash,$host,@cmds) = @_;
+  my $name = $hash->{NAME};
+  my $type = $hash->{TYPE};
+  my ($fhemcmd,$ident,$reading,$value);
+
+  return if (IsDisabled $name);  
+    
+  foreach my $cmd (@cmds) {
+    ($fhemcmd,$ident,$reading,$value) = split("::",$cmd);
+    $reading =~ s/[^A-Za-z\d_\.\-\/]/_/g;   #allowed chars for readings names
+#    next if $fhemcmd eq "setreading" && (not(defined $value) || $value eq "");
+    my $as = (AttrVal($name,"autosave",AttrVal("global","autosave",1))) ? 1 : 0;
+    my $ac = (AttrVal($name,"autocreate",AttrVal("global","autoload_undefined_devices",1))) ? 1 : 0;
+    my $msg = "$ident:$host:$ac:$as:$fhemcmd|$reading|$value";
+
+    Log3 $name, 5, "$type $name: dispatch: $msg";
+    Dispatch($hash, $msg, undef);
   }
-  if (ESPEasy_isAutosaveEnabled($defs{"new"}) && $i>0) {
-    CommandSave(undef,undef);
-    Log3 $type, 2, "$type $name: autosave is enabled: $i structural changes saved.";
-  }
-  elsif ($i>0) {
-    Log3 $type, 2, "$type $name: there are $i structural changes. Don't forget to save chages.";
-  }
-	return undef;
+  return undef;
 }
 
 
 # ------------------------------------------------------------------------------
-sub ESPEasy_Attr(@)
+sub ESPEasy_dispatchParse($$$) #called by logical device  (defined by $hash->{ParseFn})
 {
-  my ($cmd,$name,$aName,$aVal) = @_;
-  my $hash = $defs{$name};
-  my $type = $hash->{TYPE};
-  my $ret = undef;
+  # we are called from dispatch() from the ESPEasy bridge device
+  # we never come here if $msg does not match $hash->{MATCH} in the first place
+  my ($IOhash, $msg) = @_;   # IOhash points to the ESPEasy bridge, not to client devices
+  my ($IOname,$type,$self) = ($IOhash->{NAME},$IOhash->{TYPE},ESPEasy_whoami()."()");
 
-  if ($aName =~ /(Interval|pollGPIOs|IODev|readingPrefixGPIO|readingSuffixGPIOState|autosave)/
-    && $hash->{SUBTYPE} eq "bridge") {
-    Log3 $name, 1, "$type $name: attribut '$aName' can not be used by bridge";
-    return "$type: attribut '$aName' can not be used by bridge";  
+  # 1:ident (ESP Name / ESP deviceName ) 2:ip 3:autocreate 4:autosave 5:data
+  my ($ident,$ip,$ac,$as,$v) = split(":",$msg);
+  Log3 undef, 5, "$type $IOname: $self got: $msg";
+
+  return undef if !$ident || $ident eq "";
+
+  my $name;
+  my @v = split("\\|\\|",$v);
+  
+  # look in each $defs{$d}{IDENT} for $ident to get device name.
+  foreach my $d (keys %defs) {
+    next if($defs{$d}{TYPE} ne "ESPEasy");
+    if (InternalVal($defs{$d}{NAME},"IDENT","") eq "$ident") {
+      $name = $defs{$d}{NAME} ;
+      last;
+    }
   }
-  elsif ($aName =~/^(autocreate|authentication|httpReqTimeout)$/
-    && $hash->{SUBTYPE} eq "device"){
-    Log3 $name, 1, "$type $name: attribut '$aName' can be used with the ".
-                   "bridge device, only";
-    return "$type: attribut '$aName' can be used with the bridge device, only";
+
+  # autocreate device if no device has $ident asigned.
+  if (!($name) && $ac eq "1") {
+    $name = ESPEasy_autocreate($IOhash,$ident,$ip,$as);
+    delete $IOhash->{helper}{$ip}{$ident};
+  }
+  elsif (!$name) {
+    Log3 $IOname, 2, "$type $IOname: autocreate is disabled (ident: $ident)"
+      if $IOhash->{helper}{$ip}{$ident} ne "noAutocreate";
+    $IOhash->{helper}{$ip}{$ident} = "noAutocreate";
+    return $ident;
   }
   
-  if ($aName eq "disable") {
-    $ret="0,1" if ($cmd eq "set" && not $aVal =~ m/(^0|1$)/);
-    if ($cmd eq "set" && $aVal == 1) {
-      Log3 $name, 3,"$type: $name is disabled";
-      ESPEasy_deleteReadings($hash);
-      ESPEasy_resetTimer($hash,"stop");
-      readingsSingleUpdate($hash, "state", "disabled",1)}
-    elsif ($cmd eq "del" || $aVal == 0) {
-      Log3 $name, 5, "$type $name: InternalTimer(".gettimeofday()."+2,".
-                     "ESPEasy_statusRequest, $hash) ";
-      InternalTimer(gettimeofday()+2, "ESPEasy_resetTimer", $hash);
-      readingsSingleUpdate($hash, 'state', 'opened',1)
-    }}
-  elsif ($aName eq "pollGPIOs") {
-    $ret ="GPIO_No[,GPIO_No][...]" if $cmd eq "set" && $aVal !~ /^[a-zA-Z]{0,2}[0-9]+(,[a-zA-Z]{0,2}[0-9]+)*$/}
-  elsif ($aName eq "Interval") {
-    $ret =">10" if $cmd eq "set" && $aVal < 10}
-  elsif ($aName eq "autosave") {
-    $ret="0,1" if ($cmd eq "set" && not $aVal =~ m/^(0|1)$/)}
-  elsif ($aName eq "autocreate") {
-    $ret="0,1" if ($cmd eq "set" && not $aVal =~ m/^(0|1)$/)}
-  elsif ($aName eq "authentication") {
-    $ret="0,1" if ($cmd eq "set" && not $aVal =~ m/^(0|1)$/)}
-  elsif ($aName eq "readingPrefixGPIO") {
-    $ret="[a-zA-Z0-9._-/]+" if $cmd eq "set" && $aVal !~ m/^[A-Za-z\d_\.\-\/]+$/}
-  elsif ($aName eq "readingSuffixGPIOState") {
-    $ret="[a-zA-Z0-9._-/]+" if ($cmd eq "set" && $aVal !~ m/^[A-Za-z\d_\.\-\/]+$/)}
-  elsif ($aName eq "httpReqTimeout") {
-    $ret ="3..60" if $cmd eq "set" && ($aVal < 3 || $aVal > 60)}
+  my $hash = $defs{$name};
+
+  if (defined $hash && $hash->{TYPE} eq "ESPEasy" && $hash->{SUBTYPE} eq "device") {
+    foreach (@v) {
+      my ($fhemcmd,$reading,$value) = split("\\|",$_);
+
+      # reading prefix replacement
+      my $replace = '"'.AttrVal($name,"readingPrefixGPIO","GPIO").'"';
+      $reading =~ s/^GPIO/$replace/ee;
+
+      if ($fhemcmd eq "setreading") {
+        # reading suffix replacement only for setreading
+        $replace = '"'.AttrVal($name,"readingSuffixGPIOState","").'"';
+        $reading =~ s/_state$/$replace/ee;
+        readingsSingleUpdate($hash, $reading, $value, 1);
+        Log3 $name, 4, "$type $name: $reading: $value";
+      }
+
+      elsif ($fhemcmd eq "deletereading") {
+        my $dr = CommandDeleteReading(undef, "$name $reading");
+        Log3 $name, 4, "$type $name: reading $reading deleted" if $dr ne "";
+      }
       
-  if (defined $ret) {
-    Log3 $name, 2, "$type $name: attr $name $aName $aVal != $ret";
-    return "$aName must be: $ret";
+      elsif ($fhemcmd eq "setinternal") {
+        $hash->{$reading} = $value;
+        Log3 $name, 4, "$type $name: internal $reading $value";
+      }
+      
+      else {
+        Log3 $name, 4, "$type $name: Unkonwn command received via dispatch";
+      }
+
+    }
+    ESPEasy_setState($hash);
   }
+  else {
+    Log3 undef, 2, "ESPEasy: Device $name not defined";
+  }
+ 
+  return $name;  # must be != undef. else msg will processed further -> help me!
+}
+
+
+# ------------------------------------------------------------------------------
+sub ESPEasy_autocreate($$$$)
+{
+  my ($IOhash,$ident,$ip,$autosave) = @_;
+  my $IOname = $IOhash->{NAME};
+  my $IOtype = $IOhash->{TYPE};
+
+  my $devname = "ESPEasy_".$ident;
+  my $define  = "$devname ESPEasy $ip 80 $IOhash->{NAME} $ident";
+  Log3 undef, 2, "$IOtype $IOname: autocreate $define";
+
+  my $cmdret= CommandDefine(undef,$define);
+  if(!$cmdret) {
+    $cmdret= CommandAttr(undef, "$devname room $IOhash->{TYPE}");
+    $cmdret= CommandAttr(undef, "$devname group $IOhash->{TYPE} Device");
+    $cmdret= CommandAttr(undef, "$devname event-on-change-reading .*");
+    if (AttrVal($IOname,"autosave",AttrVal("global","autosave",1))) {
+      CommandSave(undef,undef);
+      Log3 undef, 2, "$IOtype $IOname: structural changes saved.";
+    } 
+    else {
+      Log3 undef, 2, "$IOtype $IOname: autosave disabled: do not forget to save changes.";
+    }
+  }
+  else {
+    Log3 undef, 1, "$IOtype $IOname: an autocreate error occurred while creating device for $ident: $cmdret";
+  } 
+
+  return $devname;
+}
+
+
+# ------------------------------------------------------------------------------
+sub ESPEasy_httpRequest($$$$$@)
+{
+  my ($hash, $host, $port, $ident, $cmd, @params) = @_;
+  my ($name,$type,$self) = ($hash->{NAME},$hash->{TYPE},ESPEasy_whoami()."()");
+  my $orgParams = join(",",@params);
+  my $orgCmd = $cmd;
+  my $url;
+  Log3 $name, 5, "$type $name: httpRequest(ip:$host, port:$port, ident:$ident, cmd:$cmd, params:$orgParams)";
+
+  if ($cmd eq "raw") {
+    $cmd = $params[0];
+    splice(@params,0,1);
+  }
+
+  $params[0] = ",".$params[0] if $params[0];
+  my $plist = join(",",@params);
+
+  if ($cmd eq "presencecheck"){
+    $url = "http://".$host.":".$port."/config";
+  }
+  else {
+    $url = "http://".$host.":".$port.$hash->{helper}{urlcmd}.$cmd.$plist;
+  }
+  
+  Log3 $name, 3, "$type $name: send $cmd$plist to $ident ($host)" if ($cmd !~ /^(status|presencecheck)/);
+  Log3 $name, 5, "$type $name: URL: $url";
+
+  my $timeout = AttrVal($name,"httpReqTimeout",10);
+  my $httpParams = {
+    url         => $url,
+    timeout     => $timeout,
+    keepalive   => 0,
+    httpversion => "1.0",
+    hideurl     => 0,
+    method      => "GET",
+    hash        => $hash,      # passthrought to parseFn;
+    cmd         => $orgCmd,    # passthrought to parseFn;
+    plist       => $orgParams, # passthrought to parseFn;
+    host        => $host,      # passthrought to parseFn;
+    port        => $port,      # passthrought to parseFn;
+    ident       => $ident,     # passthrought to parseFn;
+    callback    =>  \&ESPEasy_httpRequestParse
+  };
+  Log3 $name, 5, "$type $name: HttpUtils_NonblockingGet(ident:$ident host:$host".
+                 "port:$port timeout:$timeout cmd:$cmd $plist:$plist)";
+  HttpUtils_NonblockingGet($httpParams);
 
   return undef;
 }
+
+
+# ------------------------------------------------------------------------------
+sub ESPEasy_httpRequestParse($$$)
+{
+  my ($param, $err, $data) = @_;
+  my $hash = $param->{hash};
+  my ($name,$type,$self) = ($hash->{NAME},$hash->{TYPE},ESPEasy_whoami());
+  my @dispatchCmd;
+  
+  if ($err ne "") {
+    if (defined $hash->{helper}{$param->{host}}{presence} 
+    && $hash->{helper}{$param->{host}}{presence} ne "absent") {           #todo_ :PERL WARNING: Use of uninitialized value in string ne at ./FHEM/34_ESPEasy.pm line 907.
+       Log3 $name, 2, "$type $name: $param->{ident} error: $err";
+    }
+    $hash->{helper}{$param->{host}}{presence} = "absent";
+    push @dispatchCmd, "deletereading"."::".$param->{ident}."::"."GPIO.*"."::"."undef";
+    push @dispatchCmd, "setreading"."::".$param->{ident}."::"."presence"."::"."absent";
+  }
+
+  elsif ($data ne "") 
+  { 
+    $hash->{helper}{$param->{host}}{presence} = "present";
+    push @dispatchCmd, "setreading::".$param->{ident}."::"."presence"."::"."present";
+
+    if ($param->{cmd} =~ /^(presencecheck)$/) {
+      ESPEasy_dispatch($hash,$param->{host},@dispatchCmd);
+      return undef;
+    }
+
+    # no errors occurred
+    Log3 $name, 5, "$type $name: $self() data: \n$data";
+    if (!defined $hash->{helper}{noPm_JSON}) {
+      if ($data =~ /^{/) { #it is json...
+#        use JSON;
+        my %res = %{decode_json($data)};
+        Log3 $name, 5, "$type $name: $param->{cmd}$param->{plist} => mode:$res{mode} state:$res{state}";
+
+        $res{state} = ($res{state} == 1) ? "on" : "off" if $res{mode} =~ /^output|input$/;
+        push @dispatchCmd, "setreading::".$param->{ident}."::GPIO".$res{pin}."_mode::".$res{mode};
+        push @dispatchCmd, "setreading::".$param->{ident}."::GPIO".$res{pin}."_state::".$res{state};
+        push @dispatchCmd, "setreading::".$param->{ident}."::_lastAction::".$res{log} if $res{log} ne "";
+      } #it is json...
+
+      else { # no json returned => unknown state => delete readings
+        Log3 $name, 5, "$type $name: no json fmt: $param->{cmd}$param->{plist} => $data";
+        if ($param->{plist} =~/^gpio,(\d+)/) {
+          push @dispatchCmd, "deletereading"."::".$param->{ident}."::"."GPIO$1"."_.*"."::"."undef";
+
+        }
+      }
+    }
+
+    else { # no json installed
+      Log3 $name, 2, "$type $name: perl module JSON not installed.";
+    }
+  } # ($data ne "") 
+
+  ESPEasy_dispatch($hash,$param->{host},@dispatchCmd);
+
+  return undef;
+}
+
+
+# ------------------------------------------------------------------------------
+sub ESPEasy_statusRequest($) #called by device
+{
+  my ($hash) = @_;
+  my $name = $hash->{NAME};
+  my $type = $hash->{TYPE};
+  
+#  return if (IsDisabled $name);        ### check
+
+  my $a = AttrVal($name,"pollGPIOs","");
+  my @gpios = split(",",$a);
+  foreach my $gpio (@gpios) {
+
+    # pin mapping (eg. D8 -> 15)
+    if ($gpio =~ /^[a-zA-Z]/) {
+      Log3 $name, 5, "$type $name: pin mapping ".uc $gpio." => $ESPEasy_pinMap{uc $gpio}";
+      $gpio = $ESPEasy_pinMap{uc $gpio};
+    }
+
+    Log3 $name, 5, "$type $name: IOWrite($hash, $hash->{HOST}, $hash->{PORT}, $hash->{IDENT}, status, gpio,".$gpio.")";
+    IOWrite($hash, $hash->{HOST}, $hash->{PORT}, $hash->{IDENT}, "status", "gpio,".$gpio);
+  }
+
+  if ($a eq ""){
+    Log3 $name, 5, "$type $name: IOWrite($hash, $hash->{HOST}, $hash->{PORT}, $hash->{IDENT}, presencecheck)";
+    IOWrite($hash, $hash->{HOST}, $hash->{PORT}, $hash->{IDENT}, "presencecheck", "");
+  }
+
+  ESPEasy_resetTimer($hash);
+  return undef;
+}
+
+
+# ------------------------------------------------------------------------------
+sub ESPEasy_resetTimer($;$)
+{
+  my ($hash,$sig) = @_;
+  my $name = $hash->{NAME};
+  my $type = $hash->{TYPE};
+  $sig = "" if !$sig;
+
+  Log3 $name, 5, "$type $name: RemoveInternalTimer($hash, ESPEasy_statusRequest)";
+  RemoveInternalTimer($hash, "ESPEasy_statusRequest") if $init_done == 1;
+  
+  return undef if $sig eq "stop";
+    
+  unless(IsDisabled($name)) {
+    Log3 $name, 5, "$type $name: InternalTimer(".gettimeofday()."+".AttrVal($name,"Interval",300)."+".rand(5).", ESPEasy_statusRequest, $hash)";
+    InternalTimer(gettimeofday()+AttrVal($name,"Interval",300)+rand(5), "ESPEasy_statusRequest", $hash);
+    ESPEasy_intAt2helper($hash);
+  }
+  return undef;
+}
+
+
+# ------------------------------------------------------------------------------
+sub ESPEasy_intAt2helper($) {
+  my ($hash) = @_;
+
+  my $i = 1;
+  delete $hash->{helper}{intAt};
+  foreach my $a (keys %intAt) {
+    my $arg = $intAt{$a}{ARG};
+    my $nam = (ref($arg) eq "HASH" ) ? $arg->{NAME} : "";
+    if (defined $nam && $nam eq $hash->{NAME}) {
+      $hash->{helper}{intAt}{$i}{TRIGGERTIME} = strftime('%d.%m.%Y %H:%M:%S',
+                                            localtime($intAt{$a}{TRIGGERTIME}));
+      $hash->{helper}{intAt}{$i}{INTERVAL} = round($intAt{$a}{TRIGGERTIME}
+                                            -time,0);
+      $hash->{helper}{intAt}{$i}{FN} = $intAt{$a}{FN};
+      $i++
+    }
+  }
+}
+
+
+# ------------------------------------------------------------------------------
+sub ESPEasy_tcpServer_Open($) {
+  my ($hash) = @_;
+  my $name = $hash->{NAME};
+  my $type = $hash->{TYPE};
+
+  my $port = ($hash->{PORT}) ? $hash->{PORT} : 8383;
+
+
+  # Open TCP socket
+  my $ret = TcpServer_Open( $hash, $port, "global" );
+    
+  if( $ret && !$init_done ) {
+    Log3 $name, 2, "$type $name: => $ret. Exiting.";
+    exit(1);
+  }
+    
+  readingsSingleUpdate ( $hash, "state", "initialized", 1 );
+    
+  return $ret;
+}
+
+
+# ------------------------------------------------------------------------------
+sub ESPEasy_header2Hash($) {
+  my ($string) = @_;
+  my %header = ();
+
+  foreach my $line (split("\r\n", $string)) {
+    my ($key,$value) = split(" ", $line,2);
+    next if !$value;
+
+    $value =~ s/^ //;
+    $key =~ s/:$//;
+    $header{$key} = $value;
+  }     
+        
+  return \%header;
+}
+
+
+# ------------------------------------------------------------------------------
+sub ESPEasy_sendHttpClose($$) {
+
+    my ($con,$response) = @_;
+    print $con "HTTP/1.1 200 OK\r\n",
+           "Content-Type: text/plain\r\n",
+           "Connection: close\r\n",
+           "Content-Length: ".length($response)."\r\n\r\n",
+           $response;
+        
+    return undef;
+}
+
+
+# ------------------------------------------------------------------------------
+sub ESPEasy_deleteReadings($;$)
+{
+  my ($hash,$reading) = @_;
+  my ($name,$type) = ($hash->{NAME},$hash->{TYPE});
+
+  if ($reading) {
+    CommandDeleteReading(undef, "$name $reading");
+    Log3 $name, 4, "$type $name: reading $reading wiped out";
+
+  } else {
+    my @dr;
+    my @r = keys %{$hash->{READINGS}};
+    foreach my $r (@r) {
+      next if $r =~ m/^(presence|state)$/;
+      CommandDeleteReading(undef, "$name $r");
+      push(@dr,$r);
+    }
+    Log3 $name, 4, "$type $name: readings [".join(",",@dr)."] wiped out" if scalar @dr > 1;
+  }
+
+  ESPEasy_setState($hash,"opened");
+  return undef;
+}
+
+
+# ------------------------------------------------------------------------------
+sub ESPEasy_paramPos($$)
+{
+  my ($cmd,$search) = @_;
+  my @usage = split(" ",$ESPEasy_setCmdsUsage{$cmd});
+  my $pos = 0;
+  my $i = 0;
+
+  foreach (@usage) {
+    if ($_ eq $search) {
+      $pos = $i;
+      last;
+    }
+    $i++;
+  }
+  
+  return $pos; # return 0 if no match, else position
+}
+
+
+# ------------------------------------------------------------------------------
+sub ESPEasy_checkVersions($$$$)
+{
+  my ($hash,$dev,$ve,$vj) = @_;
+  my ($type,$name) = ($hash->{TYPE},$hash->{NAME});
+  my $ov = "_OUTDATED_ESP_VER_$dev";
+
+  if (($ve < $ESPEasy_minESPEasyBuild 
+  || $vj < $ESPEasy_minJsonVersion)
+  && not exists $hash->{$ov}) {
+    $hash->{$ov} = "R".$ve."/J".$vj;
+    Log3 $name, 2, "$type $name: ESPEasy plugin _C009 ".
+                   "(R".$ve."/J".$vj.") is too old. ".
+                   "Use ESPEasy build R$ESPEasy_minESPEasyBuild at least.";
+  } 
+  
+  elsif ($ve >= $ESPEasy_minESPEasyBuild && $vj >= $ESPEasy_minJsonVersion
+  && exists $hash->{$ov}) {
+    delete $hash->{$ov};
+  }
+}
+
+
+# ------------------------------------------------------------------------------
+sub ESPEasy_setState($;$)
+{
+  my ($hash,$stateStr) = @_;
+  my $name = $hash->{NAME};
+  my $type = $hash->{TYPE};
+  return undef if not AttrVal($name,"setState",1);
+  $stateStr = "initialized" if not defined $stateStr;
+
+  my @ret;
+  foreach my $reading (sort keys %{$hash->{READINGS}}) {
+    next if $reading =~ /^(state|presence|_lastAction)$/;
+    push(@ret, uc(substr($reading,0,1)).substr($reading,1,2).
+                         ":".ReadingsVal($name,$reading,""));
+  }
+
+  my $state = (scalar @ret >= 1) ? join(" ",@ret) : $stateStr;
+  readingsSingleUpdate($hash,"state",$state, 1 );
+
+  return undef;
+}
+
+
+# ------------------------------------------------------------------------------
+sub ESPEasy_isPmInstalled($$)
+{
+  my ($hash,$pm) = @_;
+  my ($name,$type) = ($hash->{NAME},$hash->{TYPE});
+  if (not eval "use $pm;1")
+  {
+    Log3 $name, 1, "$type $name: perl modul missing: $pm. Install it, please.";
+    $hash->{MISSING_MODULES} .= "$pm ";
+    return "failed: $pm";
+  }
+  return undef;
+}
+
+
+# ------------------------------------------------------------------------------
+sub ESPEasy_isAuthenticated($$$)
+{
+  my ($hash,$ah,$ip) = @_;
+  my $name = $hash->{NAME};
+  my $type = $hash->{TYPE};
+
+  my $u = getKeyValue($type."_".$name."-user");
+  my $p = getKeyValue($type."_".$name."-pass");
+  my $attr = AttrVal($name,"authentication",0);
+
+  if (!defined $u || !defined $p || $attr == 0) {
+    if (defined $ah){
+      Log3 $name, 2, "$type $name: no basic authentication required but ".
+                     "credentials received ($ip)";
+    } else {
+       Log3 $name, 5, "$type $name: no basic authentication required";
+    }
+      return "not required";
+  }
+  elsif (defined $ah)
+  {
+    my ($a,$v) = split(" ",$ah);
+    if ($a eq "Basic" && decode_base64($v) eq $u.":".$p){
+      Log3 $name, 5, "$type $name: basic authentication accepted";
+      return "accepted";
+    }
+    else {
+      Log3 $name, 2, "$type $name: basic authentication rejected ($ip)";
+      return undef;
+    }
+  }
+  else 
+  {
+  Log3 $name, 2, "$type $name: basic authentication required but ".
+                 "no credentials received ($ip)";
+    return undef;
+  }
+
+return undef; # should never be reached.
+}
+
+
+# ------------------------------------------------------------------------------
+sub ESPEasy_isIPv4($) {return if(!defined $_[0]); return 1 if($_[0] 
+  =~ /^(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$/)}
+
+
+# ------------------------------------------------------------------------------
+sub ESPEasy_isFqdn($) {return if(!defined $_[0]); return 1 if($_[0] 
+  =~ /^(?=^.{4,253}$)(^((?!-)[a-zA-Z0-9-]{1,63}(?<!-)\.)+[a-zA-Z]{2,63}$)$/)}
 
 
 # ------------------------------------------------------------------------------
@@ -1146,6 +1345,8 @@ sub ESPEasy_whoami()  {return (split('::',(caller(1))[3]))[1] || '';}
 
 =pod
 =item device
+=item summary control and access to ESP8266/ESPEasy
+=item summary_DE Steuerung und Zugriff auf ESP8266/ESPEasy
 =begin html
 
 <a name="ESPEasy"></a>
@@ -1154,24 +1355,33 @@ sub ESPEasy_whoami()  {return (split('::',(caller(1))[3]))[1] || '';}
   <p>
     Provides control to ESP8266/ESPEasy
   </p>
-  <b>Notes</b>
+  Notes:
   <ul>
     <li>You have to define a bridge device before any logical device can be
       defined.
       </li>
-    <li>You have to configure your ESP to use "FHEM HTTP" controller protocol
-      (available in ESPEasy R109+). Furthermore the ESP controller port and the
+    <li>You have to configure your ESP to use "FHEM HTTP" controller protocol.
+      Furthermore the ESP controller port and the
       FHEM ESPEasy bridge port must be the same, of cause.
       </li><br>
-    <li>Requirements: perl module <b>JSON</b> lately.<br>
+  </ul>
+  Requirements:
+  <ul>
+    <li>perl module JSON<br>
       Use "cpan install JSON" or operating system's package manager to install
       Perl JSON Modul. Depending on your os the required package is named: 
       libjson-perl or perl-JSON.
       </li>
+    <li>ESPEasy build >= R125<br>
+      </li><br>
   </ul>
+
+
+
+
 <br>
   <a name="ESPEasydefine"></a>
-  <b>Define </b>(bridge device)<br>
+  <b>Define </b>(bridge)<br>
 <br>
   <ul>
 
@@ -1191,7 +1401,7 @@ sub ESPEasy_whoami()  {return (split('::',(caller(1))[3]))[1] || '';}
   <ul>Specifies tcp port for incoming http requests. This port must <u>not</u>
   be used by any other application or daemon on your system and must be in the
   range 1025..65535<br>
-  eg. <code>8383</code><br>
+  eg. <code>8383</code><br> (FHEM HTTP plugin default)
   </ul>
 
   </ul>
@@ -1204,11 +1414,21 @@ sub ESPEasy_whoami()  {return (split('::',(caller(1))[3]))[1] || '';}
 <br>
 
   <a name="ESPEasyget"></a>
-  <b>Get </b>(bridge device)<br>
+  <b>Get </b>(bridge)<br>
 <br>
   <ul>
     <li>&lt;reading&gt;<br>
       returns the value of the specified reading<br>
+      </li><br>
+  </ul>
+  <ul>
+    <li>user<br>
+      returns username used by basic authentication for incoming requests.<br>
+      </li><br>
+  </ul>
+  <ul>
+    <li>pass<br>
+      returns password used by basic authentication for incoming requests.<br>
       </li><br>
   </ul>
 
@@ -1216,34 +1436,38 @@ sub ESPEasy_whoami()  {return (split('::',(caller(1))[3]))[1] || '';}
 
 
   <a name="ESPEasyset"></a>
-  <b>Set </b>(bridge device)<br>
+  <b>Set </b>(bridge)<br>
 <br>
   <ul>
-<li>user<br>
-Specifies username used by basic authentication for incoming requests.
+<li>help<br>
+Shows set command usage
 <br>
-required value: <code>&lt;username&gt;</code><br>
-eg. : <code>set ESPBridge user itsme</code><br>
-</li>
-<br>
+required values: <code>help|pass|user</code><br>
+</li><br>
 
 <li>pass<br>
 Specifies password used by basic authentication for incoming requests.
 <br>
 required value: <code>&lt;password&gt;</code><br>
 eg. : <code>set ESPBridge pass secretpass</code><br>
-</li>
+</li><br>
+
+<li>user<br>
+Specifies username used by basic authentication for incoming requests.
 <br>
+required value: <code>&lt;username&gt;</code><br>
+eg. : <code>set ESPBridge user itsme</code><br>
+</li><br>
 
-
+  <br>
   </ul>
 
  <a name="ESPEasyattr"></a>
-  <b>Attributes </b>(bridge device)<br><br>
+  <b>Attributes </b>(bridge)<br><br>
   <ul>
     <li>authentication<br>
       Used to enable basic authentication for incoming requests<br>
-      Note that user, pass and attribut authentication must be set to activate
+      Note that user, pass and authentication attribut must be set to activate
       basic authentication<br>
       Possible values: 0,1<br>
       </li><br>
@@ -1252,9 +1476,28 @@ eg. : <code>set ESPBridge pass secretpass</code><br>
       Possible values: 0|1<br>
       Default: 1
       </li><br>
+    <li>autosave<br>
+      Used to overwrite global autosave setting<br>
+      Possible values: 0|1<br>
+      Default: 1
+      </li><br>
     <li>disable<br>
       Used to disable device<br>
       Possible values: 0,1<br>
+      </li><br>
+    <li>httpReqTimeout<br>
+      Specifies seconds to wait for a http answer from ESP8266 device<br>
+      Possible values: 4..60<br>
+      Default: 10 seconds
+      </li><br>
+    <li>uniqIDs<br>
+      Used to generate unique identifiers (ESPName + DeviceName)<br>
+      If you disable this attribut (set to 0) then your logical devices will be
+      identified (and created) by the device name, only. Can be used to collect
+      values from multiple ESP devices to a single FHEM device. Pay attention
+      that value names must be unique in this case.<br>
+      Possible values: 0|1<br>
+      Default: 1 (enabled)
       </li><br>
   </ul>
 
@@ -1265,7 +1508,8 @@ eg. : <code>set ESPBridge pass secretpass</code><br>
   <a name="ESPEasydefine"></a>
   <b>Define </b>(logical device)<br><br>
   <ul>
-  Note: logical devices will be created automatically if any values are received
+  Notes:<br>
+  Logical devices will be created automatically if any values are received
   by the bridge device and autocreate is not disabled. If you configured your
   ESP in a way that no data is send independently then you have to define
   logical devices. At least wifi rssi value could be defined to use autocreate.
@@ -1307,22 +1551,29 @@ eg. : <code>set ESPBridge pass secretpass</code><br>
 <br>
   <ul>
   <code>&lt;identifier&gt;</code>
-  <ul>Specifies an identifier that will bind your ESP to this device. Must be
-    identical with ESP name (ESP GUI -&gt; Config -&gt; Main Settings -&gt; Name)
+  <ul>Specifies an identifier that will bind your ESP to this device.
+    Depending on attribut uniqIDs this must be &lt;esp name&gt; or 
+    &lt;esp name&gt;_&lt;device name&gt;.<br>
+    ESP name and device name can be found here:<br>
+    &lt;esp name&gt;: =&gt; ESP GUI =&gt; Config =&gt; Main Settings =&gt; Name<br>
+    &lt;device name&gt;: =&gt; ESP GUI =&gt; Devices =&gt; Edit =&gt;
+    Task Settings =&gt; Name
     <br>
+    eg. <code>ESPxx_DHT22</code><br>
     eg. <code>ESPxx</code><br>
   </ul>
   </ul>
 
     <p><u>Define Examples:</u></p>
     <ul>
-      <li><code>define ESPxx ESPEasy 172.16.4.100 80 ESPBridge ESPxx</code></li>
+      <li><code>define ESPxx ESPEasy 172.16.4.100 80 ESPBridge EspXX_SensorXX
+      </code></li>
     </ul>
   </ul>
 <br>
 
   <a name="ESPEasyget"></a>
-  <b>Get </b>
+  <b>Get </b>(logical device)<br><br>
   <ul>
     <li>&lt;reading&gt;<br>
       returns the value of the specified reading<br>
@@ -1336,15 +1587,41 @@ eg. : <code>set ESPBridge pass secretpass</code><br>
 <br>
 
   <a name="ESPEasyset"></a>
-  <b>Set </b>
+  <b>Set </b>(logical device)<br><br>
 <br>
   <ul>
 Notes:<br>
 - Commands are case insensitive.<br>
-- Users of Wemos D1 mini or NodeMCU can use Arduino pin names instead of GPIO 
-no: D1 =&gt; GPIO5, D2 =&gt; GPIO4, ...,TX =&gt; GPIO1 (see: get pinMap)<br>
+- Users of Wemos D1 mini or NodeMCU can use Arduino pin names instead of GPIO
+numbers:<br>
+&nbsp;&nbsp;D1 =&gt; GPIO5, D2 =&gt; GPIO4, ...,TX =&gt; GPIO1 (see: get pinMap)<br>
 - low/high state can be written as 0/1 or on/off
 <br><br>
+
+<li>clearReadings<br>
+Delete all GPIO.* readings
+<br>
+required values: <code>&lt;none&gt;</code><br>
+</li>
+<br>
+
+<li>help<br>
+Shows set command usage
+<br>
+required values: <code>
+Event|GPIO|PCFLongPulse|PCFPulse|PWM|Publish|Pulse|Servo|Status|lcd|lcdcmd|
+mcpgpio|oled|oledcmd|pcapwm|pcfgpio|status|statusRequest|clearReadings|help
+</code><br>
+</li>
+<br>
+
+<li>statusRequest<br>
+Trigger a statusRequest for configured GPIOs (see attribut pollGPIOs) and a 
+presenceCheck
+<br>
+required values: <code>&lt;none&gt;</code><br>
+</li>
+<br>
 
 <li>Event<br>
 Create an event 
@@ -1506,37 +1783,11 @@ eg: <code>&lt;gpio&gt; &lt;13&gt;</code><br>
 </li>
 <br>
 
-<li>help<br>
-Shows set command usage
-<br>
-required values: <code>
-Event|GPIO|PCFLongPulse|PCFPulse|PWM|Publish|Pulse|Servo|Status|lcd|lcdcmd|
-mcpgpio|oled|oledcmd|pcapwm|pcfgpio|status|statusRequest|clearReadings|help
-</code><br>
-</li>
-<br>
-
-<li>statusRequest<br>
-Trigger a statusRequest for configured GPIOs (see attribut pollGPIOs) and a 
-presenceCheck
-<br>
-required values: <code>&lt;none&gt;</code><br>
-</li>
-<br>
-
-<li>clearReadings<br>
-Delete all GPIO.* readings
-<br>
-required values: <code>&lt;none&gt;</code><br>
-</li>
-<br>
-
   </ul>
 
-<br>
-
- <a name="ESPEasyattr"></a>
-  <b>Attributes</b>
+  <br>
+  <a name="ESPEasyattr"></a>
+  <b>Attributes</b>(logical device)<br><br>
   <ul>
     <li>disable<br>
       Used to disable device<br>
@@ -1548,15 +1799,10 @@ required values: <code>&lt;none&gt;</code><br>
       Eg. <code>13,15</code>
       </li><br>
     <li>Interval<br>
-      Used to set polling interval of GPIOs in seconds<br>
+      Used to set polling interval of GPIOs in seconds and presence of ESP<br>
       Possible values: secs > 10<br>
       Default: 300
       Eg. <code>300</code>
-      </li><br>
-    <li>autosave<br>
-      Used to overwrite global autosave setting<br>
-      Possible values: 0|1<br>
-      Default: 1
       </li><br>
     <li>readingPrefixGPIO<br>
       Specifies a prefix for readings based on GPIO numbers. For example:
@@ -1569,9 +1815,15 @@ required values: <code>&lt;none&gt;</code><br>
       Default: GPIO
       </li><br>
     <li>readingSuffixGPIOState<br>
-      to be done...
+      Specifies a suffix for the state reading of GPIOs.
       <br>
       Default: no suffix
+      </li><br>
+    <li>setState<br>
+      Summarize values in state reading.
+      <br>
+      Possible values: 0,1<br>
+      Default: 1 (enabled)
       </li><br>
 
   </ul>

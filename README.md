@@ -5,6 +5,10 @@ Developer branch
 
 Download the module and copy it to your FHEM-Modul folder.
 
+**ESPEasy Version R126 required**
+
+An ESPEasy binary can be found here, as long as 
+
 ### Release Notes:
 ```
 0.1   - public release
@@ -31,6 +35,7 @@ Download the module and copy it to your FHEM-Modul folder.
       - show usage if there are too few arguments
       - command reference adopted
 
+
 0.2.0 - chanched module design to bridge/device version
 0.2.1 - own tcp port (default 8383) for communication from esp to fhem
       - added basic authentication for incoming requests
@@ -46,7 +51,24 @@ Download the module and copy it to your FHEM-Modul folder.
         usage: 'raw <newCommand> <param1> <param2> <...>'
 0.2.4  - code cleanup
        - fixed "use TcpServerUtils"
-      
+       - removed controls_ESPEasy.txt from dev version
+0.2.5  - fixed PERL WARNING: keys on reference is experimental for perl versions >= 5.20?
+
+
+0.3.0  - process json data if available (ESPEasy Version R126 required)
+0.3.1  - added uniqIDs attribut
+       - added get user/pass commands
+0.3.2  - fixed auth bug
+0.3.3  - state will contain readingvals
+       - default room for bridge is ESPEasy, too.
+       - Log outdated ESPEasy (without json) once.
+       - JSON decoding error handling
+0.3.4  - code cleanup
+0.3.5  - dispatch ESP paramater to device internals if changed
+       - added attribute setState (disable value mapping to state)
+0.4.0  - command reference updated
+       - RC1
+
 ```
 
 #Command Reference#
@@ -57,24 +79,33 @@ Download the module and copy it to your FHEM-Modul folder.
   <p>
     Provides control to ESP8266/ESPEasy
   </p>
-  <b>Notes</b>
+  Notes:
   <ul>
     <li>You have to define a bridge device before any logical device can be
       defined.
       </li>
-    <li>You have to configure your ESP to use "FHEM HTTP" controller protocol
-      (available in ESPEasy R109+). Furthermore the ESP controller port and the
+    <li>You have to configure your ESP to use "FHEM HTTP" controller protocol.
+      Furthermore the ESP controller port and the
       FHEM ESPEasy bridge port must be the same, of cause.
       </li><br>
-    <li>Requirements: perl module <b>JSON</b> lately.<br>
+  </ul>
+  Requirements:
+  <ul>
+    <li>perl module JSON<br>
       Use "cpan install JSON" or operating system's package manager to install
       Perl JSON Modul. Depending on your os the required package is named: 
       libjson-perl or perl-JSON.
       </li>
+    <li>ESPEasy build &gt;= R125<br>
+      </li><br>
   </ul>
+
+
+
+
 <br>
   <a name="ESPEasydefine"></a>
-  <b>Define </b>(bridge device)<br>
+  <b>Define </b>(bridge)<br>
 <br>
   <ul>
 
@@ -91,10 +122,10 @@ Download the module and copy it to your FHEM-Modul folder.
 
   <ul>
   <code>&lt;port&gt;</code>
-  <ul>Specifies tcp port for incoming http requests. This port must <u>not</u> be used
-  by any other application or daemon on your system and must be in the range
-  1025..65535<br>
-  eg. <code>8383</code><br>
+  <ul>Specifies tcp port for incoming http requests. This port must <u>not</u>
+  be used by any other application or daemon on your system and must be in the
+  range 1025..65535<br>
+  eg. <code>8383</code><br> (FHEM HTTP plugin default)
   </ul>
 
   </ul>
@@ -107,11 +138,21 @@ Download the module and copy it to your FHEM-Modul folder.
 <br>
 
   <a name="ESPEasyget"></a>
-  <b>Get </b>(bridge device)<br>
+  <b>Get </b>(bridge)<br>
 <br>
   <ul>
     <li>&lt;reading&gt;<br>
       returns the value of the specified reading<br>
+      </li><br>
+  </ul>
+  <ul>
+    <li>user<br>
+      returns username used by basic authentication for incoming requests.<br>
+      </li><br>
+  </ul>
+  <ul>
+    <li>pass<br>
+      returns password used by basic authentication for incoming requests.<br>
       </li><br>
   </ul>
 
@@ -119,34 +160,38 @@ Download the module and copy it to your FHEM-Modul folder.
 
 
   <a name="ESPEasyset"></a>
-  <b>Set </b>(bridge device)<br>
+  <b>Set </b>(bridge)<br>
 <br>
   <ul>
-<li>user<br>
-Specifies username used by basic authentication for incoming requests.
+<li>help<br>
+Shows set command usage
 <br>
-required value: <code>&lt;username&gt;</code><br>
-eg. : <code>set ESPBridge user itsme</code><br>
-</li>
-<br>
+required values: <code>help|pass|user</code><br>
+</li><br>
 
 <li>pass<br>
 Specifies password used by basic authentication for incoming requests.
 <br>
 required value: <code>&lt;password&gt;</code><br>
 eg. : <code>set ESPBridge pass secretpass</code><br>
-</li>
+</li><br>
+
+<li>user<br>
+Specifies username used by basic authentication for incoming requests.
 <br>
+required value: <code>&lt;username&gt;</code><br>
+eg. : <code>set ESPBridge user itsme</code><br>
+</li><br>
 
-
+  <br>
   </ul>
 
  <a name="ESPEasyattr"></a>
-  <b>Attributes </b>(bridge device)<br><br>
+  <b>Attributes </b>(bridge)<br><br>
   <ul>
     <li>authentication<br>
       Used to enable basic authentication for incoming requests<br>
-      Note that user, pass and attribut authentication must be set to activate
+      Note that user, pass and authentication attribut must be set to activate
       basic authentication<br>
       Possible values: 0,1<br>
       </li><br>
@@ -155,9 +200,28 @@ eg. : <code>set ESPBridge pass secretpass</code><br>
       Possible values: 0|1<br>
       Default: 1
       </li><br>
+    <li>autosave<br>
+      Used to overwrite global autosave setting<br>
+      Possible values: 0|1<br>
+      Default: 1
+      </li><br>
     <li>disable<br>
       Used to disable device<br>
       Possible values: 0,1<br>
+      </li><br>
+    <li>httpReqTimeout<br>
+      Specifies seconds to wait for a http answer from ESP8266 device<br>
+      Possible values: 4..60<br>
+      Default: 10 seconds
+      </li><br>
+    <li>uniqIDs<br>
+      Used to generate unique identifiers (ESPName + DeviceName)<br>
+      If you disable this attribut (set to 0) then your logical devices will be
+      identified (and created) by the device name, only. Can be used to collect
+      values from multiple ESP devices to a single FHEM device. Pay attention
+      that value names must be unique in this case.<br>
+      Possible values: 0|1<br>
+      Default: 1 (enabled)
       </li><br>
   </ul>
 
@@ -168,7 +232,8 @@ eg. : <code>set ESPBridge pass secretpass</code><br>
   <a name="ESPEasydefine"></a>
   <b>Define </b>(logical device)<br><br>
   <ul>
-  Note: logical devices will be created automatically if any values are received
+  Notes:<br>
+  Logical devices will be created automatically if any values are received
   by the bridge device and autocreate is not disabled. If you configured your
   ESP in a way that no data is send independently then you have to define
   logical devices. At least wifi rssi value could be defined to use autocreate.
@@ -210,22 +275,29 @@ eg. : <code>set ESPBridge pass secretpass</code><br>
 <br>
   <ul>
   <code>&lt;identifier&gt;</code>
-  <ul>Specifies an identifier that will bind your ESP to this device. Must be
-    identical with ESP name (ESP GUI -&gt; Config -&gt; Main Settings -&gt; Name)
+  <ul>Specifies an identifier that will bind your ESP to this device.
+    Depending on attribut uniqIDs this must be &lt;esp name&gt; or 
+    &lt;esp name&gt;_&lt;device name&gt;.<br>
+    ESP name and device name can be found here:<br>
+    &lt;esp name&gt;: =&gt; ESP GUI =&gt; Config =&gt; Main Settings =&gt; Name<br>
+    &lt;device name&gt;: =&gt; ESP GUI =&gt; Devices =&gt; Edit =&gt;
+    Task Settings =&gt; Name
     <br>
+    eg. <code>ESPxx_DHT22</code><br>
     eg. <code>ESPxx</code><br>
   </ul>
   </ul>
 
     <p><u>Define Examples:</u></p>
     <ul>
-      <li><code>define ESPxx ESPEasy 172.16.4.100 80 ESPBridge ESPxx</code></li>
+      <li><code>define ESPxx ESPEasy 172.16.4.100 80 ESPBridge EspXX_SensorXX
+      </code></li>
     </ul>
   </ul>
 <br>
 
   <a name="ESPEasyget"></a>
-  <b>Get </b>
+  <b>Get </b>(logical device)<br><br>
   <ul>
     <li>&lt;reading&gt;<br>
       returns the value of the specified reading<br>
@@ -239,15 +311,41 @@ eg. : <code>set ESPBridge pass secretpass</code><br>
 <br>
 
   <a name="ESPEasyset"></a>
-  <b>Set </b>
+  <b>Set </b>(logical device)<br><br>
 <br>
   <ul>
 Notes:<br>
 - Commands are case insensitive.<br>
-- Users of Wemos D1 mini or NodeMCU can use Arduino pin names instead of GPIO 
-no: D1 =&gt; GPIO5, D2 =&gt; GPIO4, ...,TX =&gt; GPIO1 (see: get pinMap)<br>
+- Users of Wemos D1 mini or NodeMCU can use Arduino pin names instead of GPIO
+numbers:<br>
+&nbsp;&nbsp;D1 =&gt; GPIO5, D2 =&gt; GPIO4, ...,TX =&gt; GPIO1 (see: get pinMap)<br>
 - low/high state can be written as 0/1 or on/off
 <br><br>
+
+<li>clearReadings<br>
+Delete all GPIO.* readings
+<br>
+required values: <code>&lt;none&gt;</code><br>
+</li>
+<br>
+
+<li>help<br>
+Shows set command usage
+<br>
+required values: <code>
+Event|GPIO|PCFLongPulse|PCFPulse|PWM|Publish|Pulse|Servo|Status|lcd|lcdcmd|
+mcpgpio|oled|oledcmd|pcapwm|pcfgpio|status|statusRequest|clearReadings|help
+</code><br>
+</li>
+<br>
+
+<li>statusRequest<br>
+Trigger a statusRequest for configured GPIOs (see attribut pollGPIOs) and a 
+presenceCheck
+<br>
+required values: <code>&lt;none&gt;</code><br>
+</li>
+<br>
 
 <li>Event<br>
 Create an event 
@@ -409,37 +507,11 @@ eg: <code>&lt;gpio&gt; &lt;13&gt;</code><br>
 </li>
 <br>
 
-<li>help<br>
-Shows set command usage
-<br>
-required values: <code>
-Event|GPIO|PCFLongPulse|PCFPulse|PWM|Publish|Pulse|Servo|Status|lcd|lcdcmd|
-mcpgpio|oled|oledcmd|pcapwm|pcfgpio|status|statusRequest|clearReadings|help
-</code><br>
-</li>
-<br>
-
-<li>statusRequest<br>
-Trigger a statusRequest for configured GPIOs (see attribut pollGPIOs) and a 
-presenceCheck
-<br>
-required values: <code>&lt;none&gt;</code><br>
-</li>
-<br>
-
-<li>clearReadings<br>
-Delete all GPIO.* readings
-<br>
-required values: <code>&lt;none&gt;</code><br>
-</li>
-<br>
-
   </ul>
 
-<br>
-
- <a name="ESPEasyattr"></a>
-  <b>Attributes</b>
+  <br>
+  <a name="ESPEasyattr"></a>
+  <b>Attributes</b>(logical device)<br><br>
   <ul>
     <li>disable<br>
       Used to disable device<br>
@@ -451,15 +523,10 @@ required values: <code>&lt;none&gt;</code><br>
       Eg. <code>13,15</code>
       </li><br>
     <li>Interval<br>
-      Used to set polling interval of GPIOs in seconds<br>
+      Used to set polling interval of GPIOs in seconds and presence of ESP<br>
       Possible values: secs &gt; 10<br>
       Default: 300
       Eg. <code>300</code>
-      </li><br>
-    <li>autosave<br>
-      Used to overwrite global autosave setting<br>
-      Possible values: 0|1<br>
-      Default: 1
       </li><br>
     <li>readingPrefixGPIO<br>
       Specifies a prefix for readings based on GPIO numbers. For example:
@@ -472,9 +539,15 @@ required values: <code>&lt;none&gt;</code><br>
       Default: GPIO
       </li><br>
     <li>readingSuffixGPIOState<br>
-      to be done...
+      Specifies a suffix for the state reading of GPIOs.
       <br>
       Default: no suffix
+      </li><br>
+    <li>setState<br>
+      Summarize values in state reading.
+      <br>
+      Possible values: 0,1<br>
+      Default: 1 (enabled)
       </li><br>
 
   </ul>
