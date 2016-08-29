@@ -7,8 +7,6 @@ Download the module and copy it to your FHEM-Modul folder.
 
 **ESPEasy Version R126 required**
 
-An ESPEasy binary can be found here, as long as 
-
 ### Release Notes:
 ```
 0.1   - public release
