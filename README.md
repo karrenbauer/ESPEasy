@@ -94,7 +94,7 @@ Download the module and copy it to your FHEM-Modul folder.
       Perl JSON Modul. Depending on your os the required package is named: 
       libjson-perl or perl-JSON.
       </li>
-    <li>ESPEasy build &gt;= R125<br>
+    <li>ESPEasy build &gt;= R126<br>
       </li><br>
   </ul>
 

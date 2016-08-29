@@ -1372,7 +1372,7 @@ sub ESPEasy_whoami()  {return (split('::',(caller(1))[3]))[1] || '';}
       Perl JSON Modul. Depending on your os the required package is named: 
       libjson-perl or perl-JSON.
       </li>
-    <li>ESPEasy build >= R125<br>
+    <li>ESPEasy build >= R126<br>
       </li><br>
   </ul>
 
@@ -1787,7 +1787,7 @@ eg: <code>&lt;gpio&gt; &lt;13&gt;</code><br>
 
   <br>
   <a name="ESPEasyattr"></a>
-  <b>Attributes</b>(logical device)<br><br>
+  <b>Attributes</b> (logical device)<br><br>
   <ul>
     <li>disable<br>
       Used to disable device<br>
